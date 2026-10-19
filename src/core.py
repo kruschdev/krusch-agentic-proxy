@@ -11,15 +11,16 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.client import chat
 
 logger = logging.getLogger(__name__)
 
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_RE = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL)
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_-]*\n(.*?)```", re.DOTALL)
 _HOLODATA_RE = re.compile(r"<holodata>(.*?)</holodata>", re.DOTALL)
 
@@ -51,6 +52,7 @@ _RAG_KEYWORDS: Tuple[str, ...] = (
 
 # Bounded in-memory TTL cache for RAG lookups: key -> (timestamp, context_str)
 _RAG_CACHE: "OrderedDict[Tuple[str, str], Tuple[float, str]]" = OrderedDict()
+_RAG_CACHE_LOCK = threading.Lock()
 _RAG_CACHE_MAX_SIZE = 128
 _RAG_CACHE_TTL_SEC = 60.0
 
@@ -142,7 +144,7 @@ def _retrieve_sqlite_context(sqlite_path: str, query: str, project: str) -> List
 
 def retrieve_homelab_context(query: str, project: str = "krusch-agentic-proxy") -> str:
     """
-    Zero-Trust database memory retriever with bounded TTL caching.
+    Zero-Trust database memory retriever with thread-safe bounded TTL caching (PROXY-06).
     Queries global Postgres kruschdb when configured via env, or local Tier-1 SQLite context.db
     when KRUSCH_CONTEXT_SQLITE is set.
     """
@@ -151,13 +153,14 @@ def retrieve_homelab_context(query: str, project: str = "krusch-agentic-proxy") 
 
     cache_key = (project, query.lower())
     now = time.monotonic()
-    cached = _RAG_CACHE.get(cache_key)
-    if cached is not None:
-        ts, val = cached
-        if now - ts < _RAG_CACHE_TTL_SEC:
-            _RAG_CACHE.move_to_end(cache_key)
-            return val
-        _RAG_CACHE.pop(cache_key, None)
+    with _RAG_CACHE_LOCK:
+        cached = _RAG_CACHE.get(cache_key)
+        if cached is not None:
+            ts, val = cached
+            if now - ts < _RAG_CACHE_TTL_SEC:
+                _RAG_CACHE.move_to_end(cache_key)
+                return val
+            _RAG_CACHE.pop(cache_key, None)
 
     dsn = _resolve_rag_dsn()
     sqlite_path = os.environ.get("KRUSCH_CONTEXT_SQLITE", "").strip()
@@ -212,9 +215,10 @@ def retrieve_homelab_context(query: str, project: str = "krusch-agentic-proxy") 
         context_parts.extend(_retrieve_sqlite_context(sqlite_path, query, project))
 
     result = "\n".join(context_parts) if context_parts else ""
-    _RAG_CACHE[cache_key] = (now, result)
-    while len(_RAG_CACHE) > _RAG_CACHE_MAX_SIZE:
-        _RAG_CACHE.popitem(last=False)
+    with _RAG_CACHE_LOCK:
+        _RAG_CACHE[cache_key] = (now, result)
+        while len(_RAG_CACHE) > _RAG_CACHE_MAX_SIZE:
+            _RAG_CACHE.popitem(last=False)
     return result
 
 
@@ -355,6 +359,209 @@ def parse_tool_calls(response_text: str) -> Tuple[List[Dict[str, Any]], Optional
     return normalized, None
 
 
+_STOPWORDS: Set[str] = {
+    "the",
+    "a",
+    "an",
+    "to",
+    "in",
+    "on",
+    "at",
+    "of",
+    "for",
+    "and",
+    "or",
+    "is",
+    "are",
+    "was",
+    "were",
+    "with",
+    "by",
+    "from",
+    "as",
+    "it",
+    "this",
+    "that",
+    "please",
+    "can",
+    "you",
+    "me",
+    "my",
+}
+
+
+def _tokenize_intent(text: str) -> Set[str]:
+    """Extract lowercase alphanumeric intent tokens excluding stopwords."""
+    if not text:
+        return set()
+    # Split camelCase and snake_case into words
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    words = re.findall(r"[a-z0-9]{2,}", expanded.lower())
+    return {w for w in words if w not in _STOPWORDS}
+
+
+def _extract_tool_spec(tool: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
+    """Return (name, description, parameters) from an OpenAI or flat tool dict."""
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    name = str(fn.get("name", "")).strip()
+    desc = str(fn.get("description", "")).strip()
+    params = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
+    return name, desc, params
+
+
+def select_relevant_tools(
+    provided_tools: List[Dict[str, Any]],
+    objective: str = "",
+    messages: Optional[List[Dict[str, Any]]] = None,
+    max_tools: int = 8,
+) -> List[Dict[str, Any]]:
+    """
+    Stage 1 of the 3-Stage Smart Tool Token Limiter (PROXY-04):
+    When len(provided_tools) > max_tools (default 8), rank tools by query keyword/intent
+    overlap + diversity against `objective`, keeping top K <= max_tools plus any tool
+    already referenced in `messages`.
+    """
+    if not provided_tools or len(provided_tools) <= max_tools:
+        return list(provided_tools or [])
+
+    referenced_names: Set[str] = set()
+    for msg in messages or []:
+        if msg.get("role") == "tool" and msg.get("name"):
+            referenced_names.add(str(msg["name"]))
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if isinstance(fn, dict) and fn.get("name"):
+                referenced_names.add(str(fn["name"]))
+
+    obj_lower = (objective or "").lower()
+    query_tokens = _tokenize_intent(objective)
+    query_prefixes = {t[:4] for t in query_tokens if len(t) >= 4}
+
+    scored: List[Tuple[float, int, str, Dict[str, Any]]] = []
+    for idx, tool in enumerate(provided_tools):
+        name, desc, params = _extract_tool_spec(tool)
+        name_lower = name.lower()
+        score = 0.0
+
+        if name in referenced_names or (name_lower and name_lower in obj_lower):
+            score += 100.0
+
+        name_tokens = _tokenize_intent(name)
+        desc_tokens = _tokenize_intent(desc)
+        props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+        param_tokens: Set[str] = set()
+        for p_name, p_schema in props.items():
+            param_tokens |= _tokenize_intent(str(p_name))
+            if isinstance(p_schema, dict):
+                param_tokens |= _tokenize_intent(str(p_schema.get("description", "")))
+
+        score += 3.0 * len(query_tokens & name_tokens)
+        score += 1.5 * len(query_tokens & param_tokens)
+        score += 1.0 * len(query_tokens & desc_tokens)
+
+        all_tool_prefixes = {t[:4] for t in (name_tokens | desc_tokens | param_tokens) if len(t) >= 4}
+        score += 0.5 * len(query_prefixes & all_tool_prefixes)
+
+        prefix_group = name_lower.split("_")[0] if "_" in name_lower else name_lower[:4]
+        scored.append((score, idx, prefix_group, tool))
+
+    # Always keep referenced tools, then select highest-scoring tools with prefix diversity
+    selected_indices: Set[int] = set()
+    group_counts: Dict[str, int] = {}
+
+    for score, idx, group, _ in sorted(scored, key=lambda x: (-x[0], x[1])):
+        if score >= 100.0:
+            selected_indices.add(idx)
+            group_counts[group] = group_counts.get(group, 0) + 1
+
+    # Diversity-aware greedy selection up to max_tools
+    remaining = [item for item in scored if item[1] not in selected_indices]
+    while len(selected_indices) < max_tools and remaining:
+        best_item = max(
+            remaining,
+            key=lambda x: (x[0] - 0.35 * group_counts.get(x[2], 0), -x[1]),
+        )
+        selected_indices.add(best_item[1])
+        group_counts[best_item[2]] = group_counts.get(best_item[2], 0) + 1
+        remaining = [item for item in remaining if item[1] != best_item[1]]
+
+    return [provided_tools[i] for i in sorted(selected_indices)]
+
+
+def compact_tool_schemas(
+    tools: List[Dict[str, Any]], max_desc_chars: int = 160
+) -> List[Dict[str, Any]]:
+    """
+    Stage 2 of the 3-Stage Smart Tool Token Limiter (PROXY-04):
+    Produce concise tool schema dictionaries by stripping redundant metadata and
+    truncating overly verbose descriptions while preserving all parameter names/types.
+    """
+    compacted: List[Dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        is_wrapped = "function" in tool and isinstance(tool["function"], dict)
+        fn = dict(tool["function"]) if is_wrapped else dict(tool)
+
+        desc = fn.get("description")
+        if isinstance(desc, str) and len(desc) > max_desc_chars:
+            fn["description"] = desc[: max_desc_chars - 3].rstrip() + "..."
+
+        params = fn.get("parameters")
+        if isinstance(params, dict):
+            clean_params: Dict[str, Any] = {"type": params.get("type", "object")}
+            props = params.get("properties")
+            if isinstance(props, dict):
+                clean_props: Dict[str, Any] = {}
+                for p_name, p_val in props.items():
+                    if isinstance(p_val, dict):
+                        p_copy = {
+                            k: v
+                            for k, v in p_val.items()
+                            if k not in ("title", "$schema", "additionalProperties")
+                        }
+                        p_desc = p_copy.get("description")
+                        if isinstance(p_desc, str) and len(p_desc) > max_desc_chars:
+                            p_copy["description"] = p_desc[: max_desc_chars - 3].rstrip() + "..."
+                        clean_props[p_name] = p_copy
+                    else:
+                        clean_props[p_name] = p_val
+                clean_params["properties"] = clean_props
+            if "required" in params:
+                clean_params["required"] = params["required"]
+            fn["parameters"] = clean_params
+
+        if is_wrapped:
+            compacted.append({"type": tool.get("type", "function"), "function": fn})
+        else:
+            compacted.append(fn)
+    return compacted
+
+
+def format_tools_for_prompt(
+    provided_tools: List[Dict[str, Any]],
+    objective: str = "",
+    messages: Optional[List[Dict[str, Any]]] = None,
+    max_tools: int = 8,
+    max_chars: int = 6000,
+) -> str:
+    """
+    3-Stage Smart Tool Token Limiter (PROXY-04):
+      Stage 1: Rank & filter tools to top K <= max_tools (plus referenced tools).
+      Stage 2: Compact descriptions and serialize with separators=(",", ":").
+      Stage 3: Enforce hard character/token budget by tightening description limits if needed.
+    """
+    filtered = select_relevant_tools(
+        provided_tools, objective=objective, messages=messages, max_tools=max_tools
+    )
+    compacted = compact_tool_schemas(filtered, max_desc_chars=160)
+    serialized = json.dumps(compacted, separators=(",", ":"))
+    if len(serialized) > max_chars:
+        tighter = compact_tool_schemas(filtered, max_desc_chars=60)
+        serialized = json.dumps(tighter, separators=(",", ":"))
+    return serialized
+
+
 class KruschEngine:
     """
     Standalone implementation of the Dual-Engine Krusch Cognitive Architecture.
@@ -396,6 +603,7 @@ class KruschEngine:
         Returns a tuple: (Cognitive Blueprint, Final Response)
         """
         model = target_model if target_model else self.default_model
+        waterfall_routes = self.config.get("waterfall_routes", [])
 
         # --- FAST-PATH TOOL-CALL ROUTING ---
         if is_tool_call:
@@ -407,6 +615,7 @@ class KruschEngine:
                 "temperature": 0.0,
                 "max_tokens": max_tokens,
                 "response_format": {"type": "json_object"},
+                "waterfall_routes": waterfall_routes,
             }
             system_prompt = """You are the Krusch Agentic Tool-Calling Router.
 Your job is to read the user's objective and choose the appropriate tool(s) to call from the AVAILABLE TOOLS list.
@@ -465,6 +674,7 @@ CRITICAL RULES:
                 "model": model,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "waterfall_routes": waterfall_routes,
             }
             system_prompt = (
                 "You are a highly capable AI assistant. Answer the user's question clearly "
@@ -551,6 +761,7 @@ DO NOT write the final implementation logic yourself. You are strictly responsib
             "model": model,
             "temperature": 0.1,
             "max_tokens": 1500,
+            "waterfall_routes": waterfall_routes,
         }
 
         if is_code_exec:
@@ -594,6 +805,7 @@ CRITICAL: You MUST FIRST output the <holodata> block, and THEN output your final
                 "model": model,
                 "temperature": temperature,
                 "max_tokens": max_tokens + 1500,
+                "waterfall_routes": waterfall_routes,
             }
 
             try:
@@ -653,6 +865,7 @@ DO NOT regurgitate the blueprint back to the user. Produce exactly what the orig
                 "model": model or self.default_model,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "waterfall_routes": waterfall_routes,
             }
 
             try:

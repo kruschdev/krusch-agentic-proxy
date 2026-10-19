@@ -12,10 +12,30 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     role: str = Field(..., description="Message role: system, user, assistant, or tool")
-    content: Optional[str] = Field(None, description="Message content")
+    content: Optional[Union[str, List[Dict[str, Any]]]] = Field(None, description="Message content")
     name: Optional[str] = Field(None, description="Optional name for the message author")
     tool_calls: Optional[List[Dict[str, Any]]] = Field(None, description="Tool calls from assistant")
     tool_call_id: Optional[str] = Field(None, description="ID of the tool call this message responds to")
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def normalize_content(cls, v: Any) -> Optional[str]:
+        """Normalize OpenAI multi-part list content blocks into a single string (PROXY-10)."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            parts: List[str] = []
+            for item in v:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text_val = item.get("text") or item.get("content") or ""
+                    if isinstance(text_val, str) and text_val:
+                        parts.append(text_val)
+            return "\n".join(parts)
+        return str(v)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -37,7 +57,7 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def validate_messages_size(cls, v: List[ChatMessage]) -> List[ChatMessage]:
         """Reject oversized message payloads to prevent OOM."""
-        total_chars = sum(len(msg.content or "") for msg in v)
+        total_chars = sum(len(str(msg.content or "")) for msg in v)
         if total_chars > 500_000:  # ~500KB text limit
             raise ValueError(
                 f"Total message content ({total_chars} chars) exceeds the 500,000 character limit."

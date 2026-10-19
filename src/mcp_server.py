@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Set, Tuple
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -66,12 +66,13 @@ AGENT_TIMEOUT = float(os.environ.get("KRUSCH_AGENT_TIMEOUT", "120"))
 
 
 @mcp.tool()
-async def krusch_execute_task(objective: str) -> str:
+async def krusch_execute_task(objective: str, max_loops: int = 10) -> str:
     """
     Delegates a complex, multi-step objective to the Krusch Dual-Engine reasoning model.
     The sub-agent will autonomously execute allowlisted shell commands and read files
     to satisfy the objective before returning a final answer.
     """
+    compact_tools = json.dumps(INTERNAL_TOOLS, separators=(",", ":"))
     system_prompt = f"""You are the Krusch Autonomous Sub-Agent. 
 You have been delegated a complex objective by a frontend agent (like OpenClaw or Hermes).
 Your goal is to use your available tools to achieve the objective, and then call 'final_answer' with the result.
@@ -79,17 +80,19 @@ Your goal is to use your available tools to achieve the objective, and then call
 OBJECTIVE: {objective}
 
 AVAILABLE TOOLS:
-{json.dumps(INTERNAL_TOOLS, indent=2)}
+{compact_tools}
 """
 
     chat_history = system_prompt
-    max_loops = 10
+    effective_max_loops = max(1, min(int(max_loops), 25))
 
     async def _run_loop() -> str:
         nonlocal chat_history
         target_model = config.get("llm", {}).get("model", "qwen2.5-coder:7b")
+        seen_calls: Set[Tuple[str, str]] = set()
+        last_tool_result = ""
 
-        for iteration in range(max_loops):
+        for iteration in range(effective_max_loops):
             logger.info(f"--- Krusch Iteration {iteration + 1} ---")
 
             _, response_text = await krusch_engine.generate(
@@ -114,9 +117,21 @@ AVAILABLE TOOLS:
                     if tool_name == "final_answer":
                         return str(tool_args.get("answer", "Objective complete."))
 
+                    call_sig = (tool_name, json.dumps(tool_args, sort_keys=True))
+                    if call_sig in seen_calls:
+                        logger.warning(
+                            f"[MCP] Duplicate tool call detected ({tool_name}); breaking loop."
+                        )
+                        return (
+                            f"Error: Duplicate tool call detected for '{tool_name}'. "
+                            f"Last result: {last_tool_result}"
+                        )
+                    seen_calls.add(call_sig)
+
                     tool_result = await asyncio.to_thread(
                         execute_internal_tool, tool_name, tool_args
                     )
+                    last_tool_result = tool_result
                     logger.info(f"[*] Tool Result: {tool_result[:100]}...")
 
                     chat_history += (

@@ -7,12 +7,13 @@ through the Dual-Engine pipeline, waterfall cloud routing, or fast-path NLP.
 
 import asyncio
 from contextlib import asynccontextmanager
+import hmac
 import json
 import logging
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
 from fastapi import FastAPI, Request
@@ -22,7 +23,13 @@ import uvicorn
 # Ensure project root is in the python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.client import close_http_client, get_http_client
-from src.core import KruschEngine, parse_tool_calls
+from src.core import (
+    KruschEngine,
+    compact_tool_schemas,
+    format_tools_for_prompt,
+    parse_tool_calls,
+    select_relevant_tools,
+)
 from src.models import ChatCompletionRequest
 from src.router import WaterfallRouter
 from src.tools import INTERNAL_TOOLS, execute_internal_tool
@@ -82,6 +89,30 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Krusch Agentic Proxy (OpenAI API)", version="0.4.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def verify_api_key_middleware(request: Request, call_next):
+    """
+    Optional Bearer token verification middleware when KRUSCH_PROXY_API_KEY is set (PROXY-02).
+    Exempts /health for liveness probes.
+    """
+    required_key = os.environ.get("KRUSCH_PROXY_API_KEY", "").strip()
+    if required_key and request.url.path != "/health":
+        auth_header = request.headers.get("Authorization", "")
+        bearer_token = (
+            auth_header[len("Bearer ") :].strip()
+            if auth_header.startswith("Bearer ")
+            else ""
+        )
+        x_api_key = request.headers.get("X-API-Key", "").strip()
+        provided_token = bearer_token or x_api_key
+        if not provided_token or not hmac.compare_digest(provided_token, required_key):
+            return JSONResponse(
+                {"error": "Unauthorized: invalid or missing Bearer token."},
+                status_code=401,
+            )
+    return await call_next(request)
 
 
 def _estimate_tokens(text: Optional[str]) -> int:
@@ -254,17 +285,32 @@ async def chat_completions(request: Request):
 
     logger.info(f"[Gateway] Request for model {model}. Prompt length: {len(user_prompt)}")
 
-    provided_tools = validated.tools or []
+    tool_choice_none = (
+        isinstance(validated.tool_choice, str)
+        and validated.tool_choice.strip().lower() == "none"
+    )
+    provided_tools = [] if tool_choice_none else (validated.tools or [])
     is_stream = bool(validated.stream)
     is_passive_mode = os.environ.get("PASSIVE_MODE") == "1"
-    force_autonomous = validated.force_autonomous or False
+    # PROXY-02: Never execute autonomous host commands when PASSIVE_MODE=1
+    force_autonomous = False if is_passive_mode else bool(validated.force_autonomous)
     force_dual_engine = os.environ.get("FORCE_DUAL_ENGINE") == "1"
 
     has_inline_tools = any(
         marker in user_prompt.lower()
-        for marker in ("available tools:", "function signature:", '"parameters":', '"type": "function"')
+        for marker in (
+            "available tools:",
+            "function signature:",
+            '"parameters":',
+            '"type": "function"',
+            '"type":"function"',
+        )
     )
-    is_tool_request = bool(provided_tools) or (is_passive_mode and has_inline_tools)
+    is_tool_request = (
+        False
+        if tool_choice_none
+        else (bool(provided_tools) or (is_passive_mode and has_inline_tools))
+    )
 
     # --- SMART ROUTING GATE ---
     model_lower = model.lower()
@@ -286,14 +332,18 @@ async def chat_completions(request: Request):
             content = msg.get("content", "")
             chat_context += f"{role}: {content}\n"
 
-        _, response_text = await _engine.generate(
-            prompt=chat_context,
-            is_code_exec=False,
-            is_tool_call=False,
-            target_model=model,
-            max_tokens=validated.max_tokens or 2048,
-            temperature=validated.temperature if validated.temperature is not None else 0.6,
-        )
+        try:
+            _, response_text = await _engine.generate(
+                prompt=chat_context,
+                is_code_exec=False,
+                is_tool_call=False,
+                target_model=model,
+                max_tokens=validated.max_tokens or 2048,
+                temperature=validated.temperature if validated.temperature is not None else 0.6,
+            )
+        except RuntimeError as e:
+            logger.error(f"[Gateway] Upstream LLM failure in standard NLP: {e}")
+            return JSONResponse({"error": f"Upstream LLM failure: {str(e)}"}, status_code=502)
 
         return _format_completion_response(
             model=model,
@@ -311,14 +361,18 @@ async def chat_completions(request: Request):
             content = msg.get("content", "")
             chat_context += f"{role}: {content}\n"
 
-        blueprint, response_text = await _engine.generate(
-            prompt=chat_context,
-            is_code_exec=False,
-            is_tool_call=False,
-            target_model=model,
-            max_tokens=validated.max_tokens or 2048,
-            temperature=0.1,
-        )
+        try:
+            blueprint, response_text = await _engine.generate(
+                prompt=chat_context,
+                is_code_exec=False,
+                is_tool_call=False,
+                target_model=model,
+                max_tokens=validated.max_tokens or 2048,
+                temperature=0.1,
+            )
+        except RuntimeError as e:
+            logger.error(f"[Gateway] Upstream LLM failure in Dual-Engine NLP: {e}")
+            return JSONResponse({"error": f"Upstream LLM failure: {str(e)}"}, status_code=502)
 
         combined = response_text
         if blueprint:
@@ -341,13 +395,23 @@ async def chat_completions(request: Request):
             if msg.get("role", "user").upper() == "USER" and msg.get("content")
         ]
 
-        history_msgs = messages[:-1] if messages else []
+        # PROXY-03: Only exclude messages[-1] if it is the trailing USER message already
+        # extracted as latest_objective; preserve trailing TOOL or ASSISTANT messages.
+        if messages and messages[-1].get("role", "").upper() == "USER":
+            history_msgs = messages[:-1]
+        else:
+            history_msgs = list(messages)
+
         for msg in history_msgs:
             role = msg.get("role", "user").upper()
             content = msg.get("content")
             tool_calls_data = msg.get("tool_calls")
 
-            if role == "USER" and content:
+            if role == "SYSTEM" and content:
+                chat_history += f"SYSTEM: {content}\n"
+            elif role == "DEVELOPER" and content:
+                chat_history += f"DEVELOPER: {content}\n"
+            elif role == "USER" and content:
                 chat_history += f"USER: {content}\n"
             elif role == "ASSISTANT":
                 if content:
@@ -360,32 +424,44 @@ async def chat_completions(request: Request):
                             f"WITH ARGS: {fn.get('arguments')}\n"
                         )
             elif role == "TOOL":
-                chat_history += f"TOOL RESULT ({msg.get('name', 'unknown')}): {content}\n"
+                tool_label = msg.get("name") or msg.get("tool_call_id") or "unknown"
+                chat_history += f"TOOL RESULT ({tool_label}): {content}\n"
+
+        latest_objective = user_messages[-1].get("content") if user_messages else user_prompt
 
         prompt_str = ""
         if chat_history:
             prompt_str += f"CONVERSATION HISTORY:\n{chat_history}\n"
 
         if provided_tools:
-            prompt_str += "AVAILABLE TOOLS:\n"
-            prompt_str += f"{json.dumps(provided_tools, indent=2)}\n\n"
+            # PROXY-04: 3-Stage Smart Tool Token Limiter (relevance + diversity + compact JSON)
+            compacted_tools_json = format_tools_for_prompt(
+                provided_tools,
+                objective=str(latest_objective or ""),
+                messages=messages,
+                max_tools=8,
+            )
+            prompt_str += f"AVAILABLE TOOLS:\n{compacted_tools_json}\n\n"
 
-        latest_objective = user_messages[-1].get("content") if user_messages else user_prompt
         prompt_str += f"CURRENT OBJECTIVE:\n{latest_objective}\n\n"
         prompt_str += (
             "Based on the AVAILABLE TOOLS, select the correct tool(s) to execute the "
             "CURRENT OBJECTIVE. Follow the CRITICAL RULES from the system prompt exactly."
         )
 
-        _, response_text = await _engine.generate(
-            prompt=prompt_str,
-            is_code_exec=False,
-            is_tool_call=True,
-            exact_signature="",
-            target_model=model,
-            max_tokens=validated.max_tokens or 2048,
-            temperature=0.1,
-        )
+        try:
+            _, response_text = await _engine.generate(
+                prompt=prompt_str,
+                is_code_exec=False,
+                is_tool_call=True,
+                exact_signature="",
+                target_model=model,
+                max_tokens=validated.max_tokens or 2048,
+                temperature=0.1,
+            )
+        except RuntimeError as e:
+            logger.error(f"[Gateway] Upstream LLM failure in Tool-Calling Mode: {e}")
+            return JSONResponse({"error": f"Upstream LLM failure: {str(e)}"}, status_code=502)
 
         if not provided_tools:
             return _format_completion_response(
@@ -431,17 +507,20 @@ async def chat_completions(request: Request):
 
     # --- AUTONOMOUS AGENT LOOP ---
     async def _autonomous_loop() -> str:
+        compact_internal_tools = json.dumps(INTERNAL_TOOLS, separators=(",", ":"))
         chat_history = (
             f"You are the Krusch Autonomous Proxy. Achieve the objective.\n"
             f"CRITICAL DIRECTIVE: Check RETRIEVED HOMELAB CONTEXT (<homelab_context>) first! "
             f"If the answer to the OBJECTIVE is already present in <homelab_context> or after tool execution, "
             f"DO NOT call `run_bash_command` or `read_file` — you MUST immediately call ONLY the `final_answer` tool "
             f"with the complete explanation.\n"
-            f"AVAILABLE TOOLS:\n{json.dumps(INTERNAL_TOOLS, indent=2)}\n\n"
+            f"AVAILABLE TOOLS:\n{compact_internal_tools}\n\n"
             f"OBJECTIVE: {user_prompt}\n"
         )
         max_loops = 5
         final_answer = "Error: Agent exceeded max iterations."
+        seen_calls: Set[Tuple[str, str]] = set()
+        last_tool_result = ""
 
         for iteration in range(max_loops):
             logger.info(f"  -> Iteration {iteration + 1}...")
@@ -465,9 +544,21 @@ async def chat_completions(request: Request):
                     if tool_name == "final_answer":
                         return str(tool_args.get("answer", "Objective complete."))
 
+                    call_sig = (tool_name, json.dumps(tool_args, sort_keys=True))
+                    if call_sig in seen_calls:
+                        logger.warning(
+                            f"[Gateway] Duplicate tool call detected ({tool_name}); breaking loop."
+                        )
+                        return (
+                            f"Error: Duplicate tool call detected for '{tool_name}'. "
+                            f"Last result: {last_tool_result}"
+                        )
+                    seen_calls.add(call_sig)
+
                     tool_result = await asyncio.to_thread(
                         execute_internal_tool, tool_name, tool_args
                     )
+                    last_tool_result = tool_result
                     chat_history += (
                         f"\nASSISTANT CALLED TOOL: {tool_name}\n"
                         f"WITH ARGS: {json.dumps(tool_args)}\n"
@@ -476,7 +567,12 @@ async def chat_completions(request: Request):
             elif fallback_msg is not None:
                 return fallback_msg
             else:
-                if response_text and "final_answer" not in response_text:
+                stripped_resp = response_text.strip() if response_text else ""
+                if (
+                    stripped_resp
+                    and not stripped_resp.startswith(("{", "["))
+                    and "final_answer" not in stripped_resp
+                ):
                     return response_text
                 chat_history += "\nSYSTEM: You must output a valid JSON tool call.\n"
 
@@ -486,6 +582,9 @@ async def chat_completions(request: Request):
         final_answer = await asyncio.wait_for(_autonomous_loop(), timeout=AGENT_TIMEOUT)
     except asyncio.TimeoutError:
         final_answer = f"Error: Autonomous agent timed out after {AGENT_TIMEOUT}s."
+    except RuntimeError as e:
+        logger.error(f"[Gateway] Upstream LLM failure in autonomous loop: {e}")
+        return JSONResponse({"error": f"Upstream LLM failure: {str(e)}"}, status_code=502)
 
     return _format_completion_response(
         model=model,
@@ -569,6 +668,7 @@ async def api_generate(request: Request):
 
 
 if __name__ == "__main__":
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", 5440))
-    print(f"[*] Starting Krusch Agentic Universal API Gateway on port {port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    print(f"[*] Starting Krusch Agentic Universal API Gateway on {host}:{port}...")
+    uvicorn.run(app, host=host, port=port, log_level="info")

@@ -691,3 +691,356 @@ def test_lifecycle_scripts_and_humaneval_imports():
         assert mod is not None
 
 
+# ---------------------------------------------------------------------------
+# PROXY-01 through PROXY-11: Security, Reliability & Protocol Audit Remediations
+# ---------------------------------------------------------------------------
+
+
+def test_proxy_01_bash_command_path_enforcement_and_curl_removal(tmp_path, monkeypatch):
+    monkeypatch.setenv("KRUSCH_ALLOWED_ROOTS", str(tmp_path))
+
+    safe_file = tmp_path / "safe.log"
+    safe_file.write_text("ok", encoding="utf-8")
+
+    # Allowed paths inside KRUSCH_ALLOWED_ROOTS
+    assert _is_command_allowed(f"cat {safe_file}") is True
+    assert _is_command_allowed(f"head -n 5 {safe_file}") is True
+    assert _is_command_allowed(f"grep ok {safe_file}") is True
+    assert _is_command_allowed(f"find {tmp_path} -maxdepth 1 -name '*.log'") is True
+
+    # Blocked sensitive files and paths outside allowed roots
+    assert _is_command_allowed("cat .env") is False
+    assert _is_command_allowed(f"cat {tmp_path}/.env") is False
+    assert _is_command_allowed(f"cat {tmp_path}/.env.local") is False
+    assert _is_command_allowed("cat ~/.ssh/id_rsa") is False
+    assert _is_command_allowed("cat /etc/passwd") is False
+    assert _is_command_allowed("head -n 10 /etc/shadow") is False
+    assert _is_command_allowed("grep root /etc/passwd") is False
+    assert _is_command_allowed("find /etc -name '*.conf'") is False
+    assert _is_command_allowed("ls -la /var/log") is False
+
+    # curl removed from ALLOWED_SINGLE_COMMANDS
+    assert _is_command_allowed("curl http://example.com") is False
+    assert _is_command_allowed("curl file:///etc/passwd") is False
+    assert _is_command_allowed("curl http://127.0.0.1:5440/health") is False
+
+
+def test_proxy_02_passive_mode_blocks_autonomous_and_bearer_auth(monkeypatch):
+    monkeypatch.setenv("KRUSCH_DISABLE_RAG", "1")
+    client = TestClient(app)
+
+    # 1. When PASSIVE_MODE=1, force_autonomous=True is ignored and host tools never run
+    monkeypatch.setenv("PASSIVE_MODE", "1")
+    with patch("src.core.chat", new_callable=AsyncMock) as mock_chat, patch(
+        "src.api_gateway.execute_internal_tool"
+    ) as mock_exec:
+        mock_chat.return_value = "Passive NLP response only."
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen2.5-coder:7b",
+                "messages": [{"role": "user", "content": "Run uname -a"}],
+                "force_autonomous": True,
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["choices"][0]["message"]["content"] == "Passive NLP response only."
+        assert mock_exec.call_count == 0
+    monkeypatch.delenv("PASSIVE_MODE", raising=False)
+
+    # 2. Optional KRUSCH_PROXY_API_KEY Bearer token middleware
+    monkeypatch.setenv("KRUSCH_PROXY_API_KEY", "krusch-test-secret-token")
+    # /health remains public
+    assert client.get("/health").status_code == 200
+    # Unauthenticated request to /v1/chat/completions is rejected with 401
+    r_unauth = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen2.5-coder:7b", "messages": [{"role": "user", "content": "Hi"}]},
+    )
+    assert r_unauth.status_code == 401
+
+    # Authenticated request with valid Bearer token succeeds
+    with patch("src.core.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = "Authenticated response"
+        r_auth = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer krusch-test-secret-token"},
+            json={"model": "qwen2.5-coder:7b", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+        assert r_auth.status_code == 200
+        assert r_auth.json()["choices"][0]["message"]["content"] == "Authenticated response"
+    monkeypatch.delenv("KRUSCH_PROXY_API_KEY", raising=False)
+
+
+def test_proxy_03_and_10_multiturn_tool_history_multipart_content_and_tool_choice_none(monkeypatch):
+    monkeypatch.setenv("KRUSCH_DISABLE_RAG", "1")
+    client = TestClient(app)
+
+    captured_prompts = []
+
+    async def fake_generate(prompt, **kwargs):
+        captured_prompts.append((prompt, kwargs))
+        return "FAST_PATH_TOOL", '{"message": "The weather in Seattle is 72F and sunny."}'
+
+    # 1. Multi-turn tool callback preserves SYSTEM, DEVELOPER, and trailing TOOL message
+    with patch("src.api_gateway._engine.generate", side_effect=fake_generate):
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen2.5-coder:7b",
+                "messages": [
+                    {"role": "system", "content": "Strict system rule."},
+                    {"role": "developer", "content": "Developer formatting rule."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What is the weather"},
+                            {"type": "text", "text": "in Seattle?"},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": '{"city": "Seattle"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "name": "get_weather",
+                        "tool_call_id": "call_1",
+                        "content": "72F and sunny",
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "get_weather", "parameters": {"type": "object"}},
+                    }
+                ],
+            },
+        )
+        assert r.status_code == 200
+        sent_prompt, sent_kwargs = captured_prompts[0]
+        assert sent_kwargs["is_tool_call"] is True
+        assert "SYSTEM: Strict system rule." in sent_prompt
+        assert "DEVELOPER: Developer formatting rule." in sent_prompt
+        assert "TOOL RESULT (get_weather): 72F and sunny" in sent_prompt
+        assert "What is the weather\nin Seattle?" in sent_prompt
+
+    # 2. tool_choice == "none" bypasses Tool-Calling Mode
+    with patch("src.core.chat", new_callable=AsyncMock) as mock_chat:
+        mock_chat.return_value = "Direct answer without tools."
+        r_none = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen2.5-coder:7b",
+                "messages": [{"role": "user", "content": "Just chat with me"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "get_weather", "parameters": {"type": "object"}},
+                    }
+                ],
+                "tool_choice": "none",
+            },
+        )
+        assert r_none.status_code == 200
+        assert r_none.json()["choices"][0]["message"]["content"] == "Direct answer without tools."
+        assert r_none.json()["choices"][0]["finish_reason"] == "stop"
+
+
+def test_proxy_04_smart_tool_token_limiter():
+    from src.core import format_tools_for_prompt, select_relevant_tools
+
+    many_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"unrelated_tool_{i}",
+                "description": "A" * 250,
+                "parameters": {
+                    "type": "object",
+                    "title": "UnneededTitle",
+                    "additionalProperties": False,
+                    "properties": {"x": {"type": "string", "description": "B" * 200}},
+                },
+            },
+        }
+        for i in range(12)
+    ]
+    many_tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "query_postgres_database",
+                "description": "Execute a read-only SQL query against the Postgres database",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"sql": {"type": "string"}},
+                    "required": ["sql"],
+                },
+            },
+        }
+    )
+
+    selected = select_relevant_tools(
+        many_tools,
+        objective="Run a SQL query on the postgres database",
+        messages=[{"role": "tool", "name": "unrelated_tool_3", "content": "prev"}],
+        max_tools=8,
+    )
+    assert len(selected) == 8
+    selected_names = {t["function"]["name"] for t in selected}
+    assert "query_postgres_database" in selected_names
+    assert "unrelated_tool_3" in selected_names
+
+    compact_str = format_tools_for_prompt(
+        many_tools,
+        objective="Run a SQL query on the postgres database",
+        max_tools=8,
+    )
+    # Compact JSON has no newline indentation and strips redundant title/additionalProperties
+    assert "\n" not in compact_str
+    assert "UnneededTitle" not in compact_str
+    assert "query_postgres_database" in compact_str
+
+
+def test_proxy_05_duplicate_call_guard_output_cap_and_malformed_json(monkeypatch):
+    monkeypatch.setenv("KRUSCH_DISABLE_RAG", "1")
+    client = TestClient(app)
+
+    # 1. Duplicate tool call guard in API gateway _autonomous_loop()
+    with patch("src.api_gateway._engine.generate", new_callable=AsyncMock) as mock_gen, patch(
+        "src.api_gateway.execute_internal_tool", return_value="STDOUT:\nhi\nSTDERR:\n"
+    ) as mock_exec:
+        mock_gen.side_effect = [
+            (
+                "FAST_PATH_TOOL",
+                '{"name": "run_bash_command", "arguments": {"command": "echo hi"}}',
+            ),
+            (
+                "FAST_PATH_TOOL",
+                '{"name": "run_bash_command", "arguments": {"command": "echo hi"}}',
+            ),
+        ]
+        r_dup = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen2.5-coder:7b",
+                "messages": [{"role": "user", "content": "Loop test"}],
+                "force_autonomous": True,
+            },
+        )
+        assert r_dup.status_code == 200
+        assert "Duplicate tool call detected" in r_dup.json()["choices"][0]["message"]["content"]
+        assert mock_exec.call_count == 1
+
+    # 2. Malformed JSON starting with '{' in _autonomous_loop() is NOT returned as final answer
+    with patch("src.api_gateway._engine.generate", new_callable=AsyncMock) as mock_gen:
+        mock_gen.side_effect = [
+            ("FAST_PATH_TOOL", '{"name": "run_bash_command", "arguments": {"command": "pwd"'),
+            ("FAST_PATH_TOOL", '{"name": "final_answer", "arguments": {"answer": "Recovered"}}'),
+        ]
+        r_mal = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen2.5-coder:7b",
+                "messages": [{"role": "user", "content": "Recover from broken JSON"}],
+                "force_autonomous": True,
+            },
+        )
+        assert r_mal.status_code == 200
+        assert r_mal.json()["choices"][0]["message"]["content"] == "Recovered"
+
+    # 3. run_bash_command output capped at 16,000 chars
+    from src.tools import MAX_BASH_OUTPUT_CHARS
+
+    fake_proc = MagicMock(stdout="X" * 25_000, stderr="")
+    with patch("src.tools.subprocess.run", return_value=fake_proc):
+        capped_out = execute_internal_tool("run_bash_command", {"command": "pwd"})
+        assert len(capped_out) == MAX_BASH_OUTPUT_CHARS
+        assert "TRUNCATED" in capped_out
+
+
+def test_proxy_06_07_08_09_11_locks_failover_502_truncated_think_and_max_loops(monkeypatch):
+    monkeypatch.setenv("KRUSCH_DISABLE_RAG", "1")
+    from src.core import _RAG_CACHE_LOCK
+    from src.mcp_server import krusch_execute_task
+
+    # 1. _RAG_CACHE_LOCK is a threading.Lock
+    assert hasattr(_RAG_CACHE_LOCK, "acquire") and hasattr(_RAG_CACHE_LOCK, "release")
+
+    # 2. Truncated <think> block without closing </think> is stripped
+    assert (
+        strip_thinking_and_fences("<think>done</think>Keep this<think>unclosed reasoning...")
+        == "Keep this"
+    )
+
+    # 3. Fleet node failover in src/client.py:chat() from remote node to local fallback
+    async def _run_failover():
+        ok_resp = MagicMock()
+        ok_resp.raise_for_status = MagicMock()
+        ok_resp.json.return_value = {
+            "choices": [{"message": {"content": "<think>unclosed..."}}]
+        }
+        ok_resp2 = MagicMock()
+        ok_resp2.raise_for_status = MagicMock()
+        ok_resp2.json.return_value = {
+            "choices": [{"message": {"content": "Local fallback succeeded"}}]
+        }
+
+        with patch("src.client.get_http_client") as mock_get_client:
+            mock_http = AsyncMock()
+            mock_http.post.side_effect = [
+                httpx.ConnectError("kruschdev unreachable"),
+                ok_resp2,
+            ]
+            mock_get_client.return_value = mock_http
+
+            res = await chat(
+                "sys",
+                "user",
+                {
+                    "api_url": "http://192.168.1.240:11434/v1/chat/completions",
+                    "model": "qwen3-coder-30b-moe:latest",
+                },
+            )
+            assert res == "Local fallback succeeded"
+            assert mock_http.post.call_count == 2
+
+    asyncio.run(_run_failover())
+
+    # 4. RuntimeError in api_gateway returns HTTP 502 instead of 500
+    client = TestClient(app)
+    with patch(
+        "src.api_gateway._engine.generate",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("All upstream nodes offline"),
+    ):
+        r_502 = client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen2.5-coder:7b", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+        assert r_502.status_code == 502
+        assert "Upstream LLM failure" in r_502.json()["error"]
+
+    # 5. krusch_execute_task accepts max_loops and breaks on duplicate tool calls
+    async def _run_mcp_guard():
+        with patch("src.mcp_server.krusch_engine.generate", new_callable=AsyncMock) as mock_gen:
+            mock_gen.return_value = ("FAST_PATH_TOOL", "not-json")
+            out = await krusch_execute_task("Test custom max_loops", max_loops=2)
+            assert "exceeded maximum iterations" in out
+            assert mock_gen.call_count == 2
+
+    asyncio.run(_run_mcp_guard())
+
+
+

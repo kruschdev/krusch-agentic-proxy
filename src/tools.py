@@ -35,8 +35,10 @@ ALLOWED_SINGLE_COMMANDS: Set[str] = {
     "whoami",
     "date",
     "uname",
-    "curl",
 }
+
+# Maximum characters returned by run_bash_command to prevent context window bloat (PROXY-05)
+MAX_BASH_OUTPUT_CHARS: int = 16_000
 
 # Two-token subcommands permitted for git and docker inspection.
 ALLOWED_SUBCOMMANDS: Set[Tuple[str, str]] = {
@@ -79,15 +81,24 @@ _DANGEROUS_CURL_FLAGS: Set[str] = {
     "--config",
     "-T",
     "--upload-file",
+    "-d",
+    "--data",
+    "--data-raw",
+    "--data-binary",
+    "--data-urlencode",
+    "-F",
+    "--form",
 }
 
 # --- SECURITY: Filesystem Read Restrictions ---
 DEFAULT_ALLOWED_ROOTS = [
     os.path.expanduser("~"),
+    "/tmp",
 ]
 
 # Sensitive directory/file names blocked even inside allowed roots
 _SENSITIVE_PATH_COMPONENTS: Set[str] = {
+    ".env",
     ".ssh",
     ".gnupg",
     ".aws",
@@ -105,6 +116,9 @@ _SENSITIVE_PATH_COMPONENTS: Set[str] = {
     "passwd",
 }
 
+# Commands whose positional arguments are file/directory paths
+_FILE_ARG_COMMANDS: Set[str] = {"ls", "cat", "head", "tail", "wc"}
+
 
 def _get_allowed_roots() -> List[str]:
     """Return the list of allowed filesystem roots, configurable via env var."""
@@ -114,10 +128,116 @@ def _get_allowed_roots() -> List[str]:
     return DEFAULT_ALLOWED_ROOTS
 
 
+def _contains_sensitive_reference(token: str) -> bool:
+    """Return True if a token references any sensitive file/directory component."""
+    cleaned = token.strip("\"'")
+    for sub in re.split(r"[/=:]", cleaned):
+        part = sub.strip()
+        if not part:
+            continue
+        if part in _SENSITIVE_PATH_COMPONENTS or part.startswith(".env."):
+            return True
+    if "/.git/config" in cleaned or cleaned == ".git/config":
+        return True
+    return False
+
+
+def _looks_like_path(token: str) -> bool:
+    """Return True if a command token represents a filesystem path."""
+    if not token or token.startswith("-"):
+        return False
+    return (
+        token.startswith(("/", "~", "./", "../"))
+        or token in (".", "..")
+        or "/" in token
+    )
+
+
+def _cap_bash_output(output: str) -> str:
+    """Cap bash command output at MAX_BASH_OUTPUT_CHARS (16,000 chars) (PROXY-05)."""
+    if len(output) <= MAX_BASH_OUTPUT_CHARS:
+        return output
+    suffix = "\n...[TRUNCATED]"
+    return output[: MAX_BASH_OUTPUT_CHARS - len(suffix)] + suffix
+
+
+def _validate_command_paths(binary: str, args: List[str]) -> bool:
+    """
+    Enforce _is_path_allowed() on all path-like arguments and file arguments
+    passed to run_bash_command (PROXY-01).
+    """
+    for tok in args:
+        if _contains_sensitive_reference(tok):
+            return False
+        if tok.startswith("-") and "=" in tok:
+            _, val = tok.split("=", 1)
+            if _contains_sensitive_reference(val):
+                return False
+            if _looks_like_path(val) and not _is_path_allowed(val):
+                return False
+        elif _looks_like_path(tok):
+            if not _is_path_allowed(tok):
+                return False
+
+    if binary in _FILE_ARG_COMMANDS:
+        skip_next = False
+        for tok in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in ("-n", "-c", "-L") and binary in ("head", "tail", "ls"):
+                skip_next = True
+                continue
+            if tok.startswith("-"):
+                continue
+            if not _is_path_allowed(tok):
+                return False
+
+    elif binary == "find":
+        # In find, arguments before the first '-' predicate are starting paths
+        for tok in args:
+            if tok.startswith("-"):
+                break
+            if not _is_path_allowed(tok):
+                return False
+
+    elif binary == "grep":
+        # In grep, non-flag positional arguments after the pattern are file paths
+        positional: List[str] = []
+        skip_next = False
+        has_explicit_pattern = False
+        for tok in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in ("-e", "--regexp"):
+                has_explicit_pattern = True
+                skip_next = True
+                continue
+            if tok in ("-f", "--file"):
+                has_explicit_pattern = True
+                skip_next = True
+                continue
+            if tok in ("-m", "-A", "-B", "-C", "--include", "--exclude", "--exclude-dir"):
+                skip_next = True
+                continue
+            if tok.startswith("-"):
+                continue
+            positional.append(tok)
+
+        file_args = positional if has_explicit_pattern else positional[1:]
+        for f_arg in file_args:
+            if not _is_path_allowed(f_arg):
+                return False
+
+    return True
+
+
 def _is_command_allowed(command: str) -> bool:
     """
-    Validate that a command contains no shell chaining/injection metacharacters
-    and matches an exact tokenized binary or two-token subcommand allowlist.
+    Validate that a command contains no shell chaining/injection metacharacters,
+    matches an exact tokenized binary or two-token subcommand allowlist, and only
+    targets allowed filesystem paths (PROXY-01).
     """
     if not isinstance(command, str):
         return False
@@ -144,12 +264,13 @@ def _is_command_allowed(command: str) -> bool:
         if binary == "find":
             if any(tok in _DANGEROUS_FIND_FLAGS for tok in tokens[1:]):
                 return False
-        elif binary == "curl":
-            if any(tok in _DANGEROUS_CURL_FLAGS for tok in tokens[1:]):
-                return False
+        if not _validate_command_paths(binary, tokens[1:]):
+            return False
         return True
 
     if len(tokens) >= 2 and (binary, tokens[1]) in ALLOWED_SUBCOMMANDS:
+        if not _validate_command_paths(binary, tokens[2:]):
+            return False
         return True
 
     return False
@@ -163,13 +284,17 @@ def _is_path_allowed(path: str) -> bool:
     if not isinstance(path, str) or not path.strip():
         return False
 
-    resolved = os.path.realpath(os.path.expanduser(path.strip()))
+    raw_expanded = os.path.expanduser(path.strip())
+    if _contains_sensitive_reference(raw_expanded):
+        return False
+
+    resolved = os.path.realpath(raw_expanded)
     parts = [p for p in resolved.split(os.sep) if p]
     basename = os.path.basename(resolved)
 
     # Block sensitive directories/files and .env secrets
     for part in parts:
-        if part in _SENSITIVE_PATH_COMPONENTS:
+        if part in _SENSITIVE_PATH_COMPONENTS or part.startswith(".env."):
             return False
     if basename == ".env" or basename.startswith(".env."):
         return False
@@ -266,8 +391,10 @@ def execute_internal_tool(tool_name: str, parameters: Dict[str, Any]) -> str:
                 )
                 data = response.json()
                 if "error" in data and not data.get("output"):
-                    return f"Execution Failed:\n{data['error']}"
-                return f"STDOUT:\n{data.get('output', '')}\nEXIT_CODE: {data.get('exit_code', '')}"
+                    return _cap_bash_output(f"Execution Failed:\n{data['error']}")
+                return _cap_bash_output(
+                    f"STDOUT:\n{data.get('output', '')}\nEXIT_CODE: {data.get('exit_code', '')}"
+                )
             except Exception as e:
                 return f"TAC Bridge Execution Failed: {str(e)}"
 
@@ -281,7 +408,7 @@ def execute_internal_tool(tool_name: str, parameters: Dict[str, Any]) -> str:
                 timeout=30,
                 cwd=os.path.expanduser("~"),
             )
-            return f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+            return _cap_bash_output(f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
         except Exception as e:
             return f"Execution Failed: {str(e)}"
 
