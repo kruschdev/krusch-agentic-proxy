@@ -5,16 +5,34 @@ Exposes the `krusch_execute_task` tool via the Model Context Protocol.
 Designed for integration with MCP clients like Cursor, OpenClaw, and Claude Desktop.
 """
 
+import asyncio
+import json
+import logging
 import os
 import sys
-import json
-import asyncio
-import logging
+from typing import Any, Dict
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+
+    class FastMCP:  # type: ignore[no-redef]
+        """Lightweight fallback decorator shim when the 'mcp' package is not installed."""
+
+        def __init__(self, name: str, **kwargs: Any):
+            self.name = name
+
+        def tool(self):
+            def _decorator(fn):
+                return fn
+
+            return _decorator
+
+        def run(self) -> None:
+            raise RuntimeError("The 'mcp' package is required to run the stdio MCP server.")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.core import KruschEngine
+from src.core import KruschEngine, parse_tool_calls
 from src.tools import INTERNAL_TOOLS, execute_internal_tool
 
 logger = logging.getLogger(__name__)
@@ -23,12 +41,21 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("KruschAgenticMCP", dependencies=["httpx", "pydantic"])
 
 
-def load_config():
+def load_config() -> Dict[str, Any]:
     try:
-        with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.json'), 'r') as f:
+        config_path = os.environ.get(
+            "KRUSCH_PROXY_CONFIG",
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json"),
+        )
+        with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"llm": {"model": "qwen2.5-coder:7b", "api_url": "http://127.0.0.1:11434/v1/chat/completions"}}
+        return {
+            "llm": {
+                "model": "qwen2.5-coder:7b",
+                "api_url": "http://127.0.0.1:11434/v1/chat/completions",
+            }
+        }
 
 
 config = load_config()
@@ -42,8 +69,8 @@ AGENT_TIMEOUT = float(os.environ.get("KRUSCH_AGENT_TIMEOUT", "120"))
 async def krusch_execute_task(objective: str) -> str:
     """
     Delegates a complex, multi-step objective to the Krusch Dual-Engine reasoning model.
-    The sub-agent will autonomously execute shell commands and read files to satisfy
-    the objective before returning a final answer.
+    The sub-agent will autonomously execute allowlisted shell commands and read files
+    to satisfy the objective before returning a final answer.
     """
     system_prompt = f"""You are the Krusch Autonomous Sub-Agent. 
 You have been delegated a complex objective by a frontend agent (like OpenClaw or Hermes).
@@ -58,53 +85,56 @@ AVAILABLE TOOLS:
     chat_history = system_prompt
     max_loops = 10
 
-    async def _run_loop():
+    async def _run_loop() -> str:
         nonlocal chat_history
+        target_model = config.get("llm", {}).get("model", "qwen2.5-coder:7b")
+
         for iteration in range(max_loops):
-            logger.info(f"--- Krusch Iteration {iteration+1} ---")
+            logger.info(f"--- Krusch Iteration {iteration + 1} ---")
 
-            target_model = config.get("llm", {}).get("model", "qwen2.5-coder:7b")
-
-            blueprint, response_text = await krusch_engine.generate(
+            _, response_text = await krusch_engine.generate(
                 prompt=chat_history,
                 is_code_exec=False,
                 is_tool_call=True,
                 exact_signature="",
                 target_model=target_model,
                 max_tokens=2048,
-                temperature=0.1
+                temperature=0.1,
             )
 
-            # Parse tool calls from response
-            tool_call = None
-            try:
-                tools = json.loads(response_text)
-                if isinstance(tools, list) and len(tools) > 0:
-                    tool_call = tools[0]
-                elif isinstance(tools, dict):
-                    tool_call = tools
-            except json.JSONDecodeError:
-                logger.warning(f"[MCP] Failed to parse tool call JSON: {response_text[:200]}")
+            tool_calls, fallback_msg = parse_tool_calls(response_text)
 
-            if tool_call and "name" in tool_call:
-                tool_name = tool_call["name"]
-                tool_args = tool_call.get("arguments", {})
+            if tool_calls:
+                for tool_call in tool_calls:
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["arguments"]
 
-                logger.info(f"[*] Calling Tool: {tool_name}")
+                    logger.info(f"[*] Calling Tool: {tool_name}")
 
-                if tool_name == "final_answer":
-                    return tool_args.get("answer", "Objective complete.")
+                    if tool_name == "final_answer":
+                        return str(tool_args.get("answer", "Objective complete."))
 
-                tool_result = execute_internal_tool(tool_name, tool_args)
-                logger.info(f"[*] Tool Result: {tool_result[:100]}...")
+                    tool_result = await asyncio.to_thread(
+                        execute_internal_tool, tool_name, tool_args
+                    )
+                    logger.info(f"[*] Tool Result: {tool_result[:100]}...")
 
-                chat_history += f"\n\nASSISTANT CALLED TOOL: {tool_name}\nWITH ARGS: {json.dumps(tool_args)}\nTOOL RESULT:\n{tool_result}\n"
+                    chat_history += (
+                        f"\n\nASSISTANT CALLED TOOL: {tool_name}\n"
+                        f"WITH ARGS: {json.dumps(tool_args)}\n"
+                        f"TOOL RESULT:\n{tool_result}\n"
+                    )
+            elif fallback_msg is not None:
+                return fallback_msg
             else:
-                chat_history += f"\n\nASSISTANT RESPONSE: {response_text}\nSYSTEM: You must call a tool. Use 'final_answer' to finish."
+                logger.warning(f"[MCP] Failed to parse tool call JSON: {response_text[:200]}")
+                chat_history += (
+                    f"\n\nASSISTANT RESPONSE: {response_text}\n"
+                    f"SYSTEM: You must call a tool. Use 'final_answer' to finish."
+                )
 
         return "Error: Krusch Agent exceeded maximum iterations without calling final_answer."
 
-    # Wrap the loop in a wall-clock timeout
     try:
         return await asyncio.wait_for(_run_loop(), timeout=AGENT_TIMEOUT)
     except asyncio.TimeoutError:

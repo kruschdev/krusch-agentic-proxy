@@ -8,25 +8,30 @@ import re
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROXY_DIR = os.path.dirname(SCRIPT_DIR)
 
-sys.path.insert(0, os.path.join(PROXY_DIR, 'src'))
+sys.path.insert(0, PROXY_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
-from src.core import KruschEngine
+from src.core import KruschEngine, get_ollama_url_for_model
 from src.client import chat
 from mtb.quality_benchmarks.tool_calling_problems import TOOL_CALLING_NEW_PROBLEMS
 from mtb.quality_benchmarks.run_quality_benchmark import _is_tool_calling, _evaluate_tool_calling
 
 MODELS = [
-    "llama3.2"
+    "qwen2.5-coder:7b",
+    "gemma4:e4b",
+    "hermes3:latest",
+    "qwen3-coder-30b-moe:latest",
 ]
 
 API_URL = "http://127.0.0.1:11434/v1/chat/completions"
 
+
 async def evaluate_naked_model(model: str, problem) -> tuple[bool, str]:
     ai_config = {
-        'api_url': API_URL,
-        'model': model,
-        'temperature': 0.1,
-        'max_tokens': 1024
+        "api_url": get_ollama_url_for_model(model, API_URL),
+        "model": model,
+        "temperature": 0.1,
+        "max_tokens": 1024,
     }
     
     # Minimal system prompt asking it to output JSON tools

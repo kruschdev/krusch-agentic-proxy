@@ -10,16 +10,17 @@ PROXY_DIR = os.path.dirname(SCRIPT_DIR)
 
 sys.path.insert(0, os.path.join(PROXY_DIR, 'src'))
 sys.path.insert(0, PROXY_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
-from src.core import KruschEngine
+from src.core import KruschEngine, get_ollama_url_for_model
 from src.client import chat
-from benchmarks.mtb.quality_benchmarks.sandbox import execute_code, SandboxResult
+from mtb.quality_benchmarks.sandbox import execute_code, SandboxResult
 
-# Only running on the RTX 3060 
+# Running on kruschserv (Dual RTX 3060 24GB)
 NODE_CONFIGS = {
-    "RTX_3060_MEDIUM": {
-        "url": "http://127.0.0.1:11434/v1/chat/completions",
-        "models": ["gemma2:9b", "yi-coder:9b"]
+    "kruschserv_Dual_RTX_3060_MEDIUM": {
+        "url": get_ollama_url_for_model("gemma4:e4b"),
+        "models": ["gemma4:e4b", "hermes3:latest"]
     }
 }
 

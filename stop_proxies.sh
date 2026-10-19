@@ -1,6 +1,6 @@
 #!/bin/bash
 # stop_proxies.sh
-# Gracefully stops the NVIDIA proxy instance using saved PID files.
+# Gracefully stops all Krusch Agentic Proxy instances (:5440 Active & :5443 Passive) using saved PID files.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PID_DIR="$SCRIPT_DIR/.pids"
@@ -14,8 +14,7 @@ stop_proxy() {
         if kill -0 "$pid" 2>/dev/null; then
             echo "[*] Stopping $name proxy (PID: $pid)..."
             kill -TERM "$pid"
-            # Wait up to 5 seconds for graceful shutdown
-            for i in $(seq 1 10); do
+            for _ in $(seq 1 10); do
                 if ! kill -0 "$pid" 2>/dev/null; then
                     echo "    $name stopped."
                     rm -f "$pidfile"
@@ -30,11 +29,11 @@ stop_proxy() {
             echo "[*] $name proxy (PID: $pid) is not running."
             rm -f "$pidfile"
         fi
-    else
-        echo "[*] No PID file for $name proxy."
     fi
 }
 
+stop_proxy "gateway_5440"
+stop_proxy "gateway_5443"
 stop_proxy "nvidia"
 
-echo "[*] NVIDIA proxy stopped."
+echo "[*] Krusch Agentic Proxy instances stopped."

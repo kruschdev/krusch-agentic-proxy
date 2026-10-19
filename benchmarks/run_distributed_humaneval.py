@@ -10,25 +10,26 @@ PROXY_DIR = os.path.dirname(SCRIPT_DIR)
 
 sys.path.insert(0, os.path.join(PROXY_DIR, 'src'))
 sys.path.insert(0, PROXY_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
-from src.core import KruschEngine
+from src.core import KruschEngine, get_ollama_url_for_model
 from src.client import chat
-from benchmarks.mtb.quality_benchmarks.sandbox import execute_code, SandboxResult
+from mtb.quality_benchmarks.sandbox import execute_code, SandboxResult
 
-# 3 Nodes (NVIDIA Only)
+# 2026-10-18 Multi-Family 5-GPU Fleet Topology
 NODE_CONFIGS = {
-    "RTX_3060": {
-        "url": "http://127.0.0.1:11434/v1/chat/completions",
-        "models": ["llama3.1:8b", "qwen2.5-coder:7b"]
+    "krusch_RTX_2080_Ti": {
+        "url": get_ollama_url_for_model("qwen2.5-coder:7b"),
+        "models": ["qwen2.5-coder:7b"],
     },
-    "RTX_3050": {
-        "url": "http://127.0.0.1:11434/v1/chat/completions",
-        "models": ["qwen2.5-coder:0.5b", "llama3.2:1b"]
+    "kruschserv_Dual_RTX_3060": {
+        "url": get_ollama_url_for_model("gemma4:e4b"),
+        "models": ["gemma4:e4b", "hermes3:latest"],
     },
-    "RTX_2080_Ti": {
-        "url": "http://10.0.0.85:11437/v1/chat/completions",
-        "models": ["qwen2.5-coder:7b"]
-    }
+    "kruschdev_Dual_RTX_2080_Ti": {
+        "url": get_ollama_url_for_model("qwen3-coder-30b-moe:latest"),
+        "models": ["qwen3-coder-30b-moe:latest"],
+    },
 }
 
 def _build_test_code(problem: dict, code: str) -> str:

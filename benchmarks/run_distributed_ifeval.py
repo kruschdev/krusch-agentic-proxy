@@ -1,25 +1,32 @@
 import os
+import sys
 import subprocess
 import json
 import time
 
+import tempfile
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROXY_DIR = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, PROXY_DIR)
+from src.core import get_ollama_url_for_model
+
 LOG_FILE = os.path.join(PROXY_DIR, "ifeval_distributed.log")
 
+# 2026-10-18 Multi-Family 5-GPU Fleet Topology
 NODE_CONFIGS = {
-    "RTX_3060": {
-        "url": "http://127.0.0.1:11434/v1/chat/completions",
-        "models": ["llama3.1:8b", "qwen2.5-coder:7b"]
+    "krusch_RTX_2080_Ti": {
+        "url": get_ollama_url_for_model("qwen2.5-coder:7b"),
+        "models": ["qwen2.5-coder:7b"],
     },
-    "RTX_3050": {
-        "url": "http://127.0.0.1:11434/v1/chat/completions",
-        "models": ["qwen2.5-coder:0.5b", "llama3.2:1b"]
+    "kruschserv_Dual_RTX_3060": {
+        "url": get_ollama_url_for_model("gemma4:e4b"),
+        "models": ["gemma4:e4b", "hermes3:latest"],
     },
-    "RTX_2080_Ti": {
-        "url": "http://10.0.0.85:11437/v1/chat/completions",
-        "models": ["qwen2.5-coder:7b"]
-    }
+    "kruschdev_Dual_RTX_2080_Ti": {
+        "url": get_ollama_url_for_model("qwen3-coder-30b-moe:latest"),
+        "models": ["qwen3-coder-30b-moe:latest"],
+    },
 }
 
 def log(msg):
@@ -48,18 +55,20 @@ def run_lm_eval(model_name, api_url, output_dir):
     log(f"Finished in {time.time() - start:.1f}s")
     
 def start_proxy(backend_url, port=5440):
-    # Temporarily write config to point to the correct backend node
-    config_path = os.path.join(PROXY_DIR, "config.json")
-    with open(config_path, "w") as f:
-        json.dump({"llm": {"api_url": backend_url, "temperature": 0.1}}, f)
-        
+    # Write an ephemeral config file via KRUSCH_PROXY_CONFIG so config.json is never clobbered
+    tmp_cfg = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump({"llm": {"api_url": backend_url, "temperature": 0.1}}, tmp_cfg)
+    tmp_cfg.close()
+
     env = os.environ.copy()
     env["FORCE_DUAL_ENGINE"] = "1"
     env["PORT"] = str(port)
-    
+    env["KRUSCH_PROXY_CONFIG"] = tmp_cfg.name
+
     cmd = ["python3", "src/api_gateway.py"]
     log(f"Starting Proxy on port {port} pointing to {backend_url}...")
     proxy_proc = subprocess.Popen(cmd, env=env, cwd=PROXY_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proxy_proc._tmp_cfg_path = tmp_cfg.name
     time.sleep(3) # Wait for proxy to start
     return proxy_proc
 
@@ -90,6 +99,9 @@ def main():
             finally:
                 proxy_proc.terminate()
                 proxy_proc.wait()
+                tmp_path = getattr(proxy_proc, "_tmp_cfg_path", None)
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
                 
     log("=== All IFEval Benchmarks Complete ===")
 

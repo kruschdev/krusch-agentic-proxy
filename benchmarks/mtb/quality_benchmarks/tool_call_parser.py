@@ -267,6 +267,7 @@ def _extract_tool_calls_from_parsed(parsed: object) -> list[ToolCall]:
     Handles:
     - Single dict with 'name' + 'arguments' keys
     - Single dict with 'function' key (maps to name)
+    - Wrapper dict with 'tool_calls' or 'calls' list
     - Array of such dicts
     - Nested 'function' dict with 'name' and 'arguments' inside
 
@@ -281,9 +282,17 @@ def _extract_tool_calls_from_parsed(parsed: object) -> list[ToolCall]:
                 if tool_call:
                     results.append(tool_call)
     elif isinstance(parsed, dict):
-        tool_call = _dict_to_tool_call(parsed)
-        if tool_call:
-            results.append(tool_call)
+        wrapper_list = parsed.get("tool_calls") or parsed.get("calls")
+        if isinstance(wrapper_list, list):
+            for item in wrapper_list:
+                if isinstance(item, dict):
+                    tool_call = _dict_to_tool_call(item)
+                    if tool_call:
+                        results.append(tool_call)
+        else:
+            tool_call = _dict_to_tool_call(parsed)
+            if tool_call:
+                results.append(tool_call)
 
     return results
 

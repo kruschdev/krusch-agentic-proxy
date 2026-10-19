@@ -4,16 +4,18 @@ import json
 import asyncio
 import time
 import re
+import argparse
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROXY_DIR = os.path.dirname(SCRIPT_DIR)
 
 sys.path.insert(0, os.path.join(PROXY_DIR, 'src'))
 sys.path.insert(0, PROXY_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
-from src.core import KruschEngine
+from src.core import KruschEngine, get_ollama_url_for_model
 from src.client import chat
-from benchmarks.mtb.quality_benchmarks.sandbox import execute_code, SandboxResult
+from mtb.quality_benchmarks.sandbox import execute_code, SandboxResult
 
 MODELS = [
     "qwen2.5-coder:7b"
@@ -29,7 +31,7 @@ def _build_test_code(problem: dict, code: str) -> str:
 async def evaluate_naked_model(model: str, problem: dict) -> tuple[bool, str]:
     ai_config = {
         'provider': 'ollama',
-        'api_url': API_URL,
+        'api_url': get_ollama_url_for_model(model, API_URL),
         'model': model,
         'temperature': 0.1,
         'max_tokens': 1024

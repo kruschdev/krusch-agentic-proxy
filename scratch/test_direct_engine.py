@@ -5,6 +5,7 @@ import os
 
 # Ensure src is in the python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("KRUSCH_CONTEXT_SQLITE", "/home/krusch/homelab/.agent/context.db")
 from src.core import KruschEngine
 
 async def run_direct():

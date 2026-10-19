@@ -1,18 +1,18 @@
 {
   "llm": {
     "api_url": "http://127.0.0.1:11434/v1/chat/completions",
-    "model": "qwen3.5:9b",
+    "model": "qwen2.5-coder:7b",
     "temperature": 0.1
   },
   "waterfall_routes": [
     {
-      "name": "VPS Hermes (Primary)",
-      "api_url": "http://my-vps-ip:8000/v1/chat/completions",
-      "model": "nous-hermes-2",
-      "api_key": "ENV:VPS_API_KEY"
+      "name": "KruschServ Non-Qwen Pool (Primary Fallback)",
+      "api_url": "http://10.10.10.2:11434/v1/chat/completions",
+      "model": "gemma4:e4b",
+      "api_key": "ENV:LOCAL_API_KEY"
     },
     {
-      "name": "OpenRouter (Fallback)",
+      "name": "OpenRouter (Cloud Fallback)",
       "api_url": "https://openrouter.ai/api/v1/chat/completions",
       "models": ["google/gemini-2.5-flash", "anthropic/claude-3.5-haiku", "meta-llama/llama-3.3-70b-instruct"],
       "api_key": "ENV:OPENROUTER_API_KEY"

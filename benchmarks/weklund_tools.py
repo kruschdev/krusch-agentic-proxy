@@ -3,19 +3,20 @@ import sys
 import json
 import asyncio
 import time
+import argparse
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROXY_DIR = os.path.dirname(SCRIPT_DIR)
 
-# Add the proxy to path
-sys.path.insert(0, os.path.join(SCRIPT_DIR, 'src'))
-
+# Add proxy root and benchmarks dir to path
+sys.path.insert(0, PROXY_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
 from src.core import KruschEngine
 from mtb.quality_benchmarks.tool_calling_problems import TOOL_CALLING_NEW_PROBLEMS
 from mtb.quality_benchmarks.run_quality_benchmark import _is_tool_calling, _evaluate_tool_calling
 
-async def run_tools_benchmark():
+async def run_tools_benchmark(cli_model: str = None):
     # Load config
     config_path = os.path.join(PROXY_DIR, 'config.json')
     try:
@@ -27,7 +28,11 @@ async def run_tools_benchmark():
 
     engine = KruschEngine(config)
     problems = TOOL_CALLING_NEW_PROBLEMS
-    target_model = config.get("llm", {}).get("model", "qwen2.5-coder:7b")
+    target_model = (
+        cli_model
+        or os.environ.get("MODEL")
+        or config.get("llm", {}).get("model", "qwen2.5-coder:7b")
+    )
     
     print(f"=== Starting Weklund Tool-Calling Benchmark ===")
     print(f"[*] Target Model: {target_model}")
@@ -83,4 +88,7 @@ async def run_tools_benchmark():
     print("====================================")
 
 if __name__ == "__main__":
-    asyncio.run(run_tools_benchmark())
+    parser = argparse.ArgumentParser(description="Run Weklund 40-problem Tool-Calling Benchmark")
+    parser.add_argument("--model", type=str, default=None, help="Target model to benchmark")
+    args = parser.parse_args()
+    asyncio.run(run_tools_benchmark(args.model))

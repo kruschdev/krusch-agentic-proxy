@@ -3,6 +3,7 @@ venv/
 bench_venv/
 env/
 .env
+.env.*
 api/config.json
 GEMINI_INFLIGHT.md
 AGENTS.md
@@ -12,18 +13,20 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
 
-# Logs
+# Logs & Debug dumps
 *.log
 *.out
 benchmark_full.log
+debug_tool_*.txt
+scratch/
 
 # OS
 .DS_Store
 Thumbs.db
 
 # Database / Docker
-# We want to keep the database directory and schema.sql, but ignore actual PG data if mapped locally
 pgdata/
 *pgdata/
 
@@ -34,3 +37,4 @@ weklund.pid
 config.json
 config.*.json
 config_*.json
+!config.example.json

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krusch-agentic-proxy"
-version = "0.3.0"
-description = "A Dual-Engine MCP Server for flawless 7B local model tool calling."
+version = "0.4.0"
+description = "A Dual-Engine MCP Server and OpenAI API Gateway for deterministic local model tool calling."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -21,9 +21,18 @@ dependencies = [
     "uvicorn>=0.44.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
 [project.scripts]
 krusch-agentic-mcp = "src.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "benchmarks"]

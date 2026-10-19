@@ -5,35 +5,38 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
 ![FastMCP](https://img.shields.io/badge/FastMCP-005571?style=flat)
-![Version: 0.3.0](https://img.shields.io/badge/Version-0.3.0-green.svg)
+![Version: 0.4.0](https://img.shields.io/badge/Version-0.4.0-green.svg)
 
-**Krusch Agentic MCP (v0.3.0)** is a standalone Model Context Protocol (MCP) server that transforms small-parameter, local-first LLMs (like `Qwen2.5-Coder-7B`) into highly reliable, structured execution nodes for autonomous agents. Now equipped with dynamic PostgreSQL relational database RAG memory injection and model-aware hardware routing.
+**Krusch Agentic MCP (v0.4.0)** is a standalone Model Context Protocol (MCP) server and OpenAI-compatible API gateway that transforms local-first LLMs (like `qwen2.5-coder:7b`, `gemma4:e4b`, and `qwen3-coder-30b-moe`) into highly reliable, structured execution nodes for autonomous agents. Equipped with non-blocking cached PostgreSQL RAG memory injection, connection-pooled HTTP transport, hardened tool sandboxing, and Multi-Family 5-GPU Fleet hardware routing.
 
 If you are running agent frameworks like **OpenClaw**, **Hermes**, or using IDEs like **Cursor**, you know the struggle: 7B models frequently hallucinate JSON tools, forget code architectures, or break under complex constraints. 
 
-Krusch Agentic MCP solves this by exposing a single MCP Tool (`krusch_execute_task`) that internally forces the local model through a rigid **Dual-Engine Topology**.
+Krusch Agentic MCP solves this by exposing a single MCP Tool (`krusch_execute_task`) and an OpenAI-compatible `/v1/chat/completions` gateway that internally route tasks through a rigid **Dual-Engine & Fast-Path Topology**.
 
 ## 🤔 Why Use Krusch Agentic MCP?
 
-1. **Zero-Hallucination Tool Calling**: By forcing models to output a rigid `<holodata>` cognitive blueprint *before* writing JSON or code, syntax errors and hallucinated tool arguments drop to near zero, unlocking reliable agentic behavior on sub-10B parameter models.
-2. **Unified API Gateway**: Acts as an OpenAI-compatible proxy (`localhost:5440`) and an MCP server (`stdio`) simultaneously, allowing any legacy or modern client (OpenClaw, Cursor, Chatbots) to benefit from the dual-engine pipeline.
-3. **Optimized Latency**: Uses **Unified Execution** mode to autoregressively stream the blueprint and the final implementation in a single pass, cutting cognitive latency in half.
-4. **Standalone Architecture**: 100% decoupled from specific business logic or local-network dependencies, designed explicitly as a generalized execution node for the open-source community.
+1. **Zero-Hallucination Tool Calling**: Forces models into strict JSON schema conformance and `<holodata>` cognitive blueprints before writing code, with unified `<think>...</think>` reasoning stripping and multi-format tool normalization (`parse_tool_calls`).
+2. **Unified API Gateway**: Acts as an OpenAI-compatible proxy (`localhost:5440` / `:5443`) and an MCP server (`stdio`) simultaneously, allowing any legacy or modern client (OpenClaw, Cursor, Chatbots) to benefit from the pipeline.
+3. **VRAM Residency & Connection Pooling**: Preserves `keep_alive: -1` GPU residency by avoiding forced `num_ctx` overrides and shares persistent `httpx.AsyncClient` connection pools across requests.
+4. **Hardened Execution Sandbox**: Tokenizes shell commands via `shlex`, blocks shell chaining/redirection metacharacters (`;`, `&&`, `|`, `` ` ``, `$()`), restricts dangerous flags (`find -exec`, `curl -o`), and isolates sensitive dotfiles (`.ssh`, `.env`, `.aws`, `.gnupg`).
 
 ### 🌊 Multi-Provider Waterfall Auto-Routing (v0.2.0+)
 
 Krusch Agentic MCP features a resilient **Waterfall Auto-Routing** proxy. You can configure multiple LLM providers to ensure task continuity if your primary model fails.
 
-- **Primary Local/VPS Models:** Route tasks to a private VPS-hosted model (like Nous Hermes) via secure API keys.
-- **Cost-Effective Fallbacks:** If the primary node is unreachable or encounters an error, the proxy automatically falls back to secondary routes like OpenRouter (e.g. Gemini Flash, Llama 3).
+- **Primary Local/VPS Models:** Route tasks to a private node or VPS-hosted model (like `gemma4:e4b` or `hermes3`) via secure API keys.
+- **Cost-Effective Fallbacks:** If the primary node is unreachable or encounters an error, the proxy automatically falls back to secondary routes like OpenRouter or Gemini Flash.
 - **Environment Variable Secrets:** Safely pass API keys via `ENV:MY_API_KEY` configurations instead of hardcoding them.
 
-### 🧠 Episodic RAG & Hardware-Aware Swarm Routing (v0.3.0+)
+### 🧠 Non-Blocking Episodic RAG & 5-GPU Fleet Routing (v0.4.0)
 
-Version 0.3.0 integrates the proxy directly with active relational/episodic memory stores and automates cross-node LLM hardware routing:
+Version 0.4.0 synchronizes the proxy with the **Multi-Family 5-GPU Local LLM Runtime Policy** and hardens memory retrieval:
 
-- **Direct PostgreSQL RAG Memory Hook:** Intercepts prompt keywords (like `gpu`, `systemd`, `postgres`) and dynamically retrieves active episodic lessons and contextual nuggets from a PostgreSQL memory database. This injected context is automatically fed to the model, eliminating baseline hallucinations of host system architectures.
-- **Dynamic Node-Aware Fleet Routing:** Automatically routes heavy MoE or reasoning models (like `Qwen3-Coder-30B` or `DeepSeek-R1-14B`) to high-capacity compute nodes (e.g. dual-GPU setups) and offloads smaller execution/ideation models (like `qwen2.5-coder:7b`) to lighter GPU instances in your network, optimizing VRAM and PCIe bandwidth across the cluster.
+- **Non-Blocking Cached PostgreSQL RAG Hook:** Intercepts domain keywords (prioritizing specific subsystems like `jean`, `dbos`, `vulkan`, `systemd`, `postgres`) and retrieves episodic lessons and nuggets via `asyncio.to_thread` with a bounded 60s TTL LRU cache (`_RAG_CACHE`) and zero hardcoded credentials (`KRUSCH_RAG_DSN` / `DATABASE_URL`).
+- **Multi-Family 5-GPU Fleet Routing:**
+  - **`kruschdev` (`10.10.10.1:11434`, Dual RTX 2080 Ti 22.5GB NVLink):** Routes heavy MoE and reasoning models (`qwen3-coder-30b-moe:latest`, `deepseek-r1:14b`).
+  - **`kruschserv` (`10.10.10.2:11434`, Dual RTX 3060 24.5GB):** Routes the non-Qwen diversity pool (`gemma4:e4b`, `hermes3:latest`).
+  - **`krusch` (`127.0.0.1:11434` / `192.168.1.13:11434`, Single RTX 2080 Ti 11.2GB):** Routes `qwen2.5-coder:7b` for fast local coding/tool routing and `bge-large:latest` for fleet embeddings.
 
 
 ### 🔄 Dual Integration Modes (MCP vs API Proxy)
@@ -63,16 +66,19 @@ When an unassisted model attempts to generate code or execute tools, it hallucin
 
 The Krusch Agentic Proxy acts as a structural safety net. By forcing the model through the Dual-Engine (Thinker + Implementer) pipeline, we see massive gains in reliability for capable edge models (7B-14B) without needing a massive LLM.
 
-#### 1. Weklund Tool-Calling Accuracy
-*Demonstrating the elimination of hallucinated parameters via Dual-Engine JSON constraints.*
+#### 1. Weklund Tool-Calling Accuracy (`v0.4.0` Verified across 5-GPU Fleet: 2026-10-18)
+*Demonstrating the elimination of hallucinated parameters and complete multi-tool / conditional planning via `v0.4.0` JSON canonicalization (`temperature=0.0`) across all 3 compute nodes (`krusch`, `kruschdev`, `kruschserv`).*
 
-| Model | Naked (Baseline) | Krusch Dual-Engine | Delta |
+| Model & Fleet Node | Naked (Baseline) | Krusch Agentic Proxy (`v0.4.0`) | Avg Latency / Task |
 | :--- | :--- | :--- | :--- |
-| **DeepSeek-R1-14B** | 76.2% | **97.5%** | 📈 **+21.3%** |
-| **Qwen 2.5 Coder 7B** | **69.1%** | **95.0%** | 📈 **+25.9%** |
-| **Yi-Coder 9B** | 63.8% | **81.4%** | 📈 **+17.6%** |
+| **Qwen3 Coder 30B MoE** (`kruschdev` Dual RTX 2080 Ti NVLink) | 82.5% | **100.0% (40/40)** | ⚡ **~0.5s** |
+| **Qwen 2.5 Coder 7B** (`krusch` Single RTX 2080 Ti) | 69.1% | **100.0% (40/40)** | ⚡ **~1.4s** |
+| **Google Gemma 4 E4B** (`kruschserv` Dual RTX 3060) | 72.5% | **100.0% (40/40)** | ⚡ **~1.2s** |
+| **Nous Hermes 3** (`kruschserv` Dual RTX 3060) | 70.0% | **100.0% (40/40)** | ⚡ **~1.9s** |
+| **DeepSeek-R1-14B** (`kruschdev` Dual RTX 2080 Ti) | 76.2% | **97.5%** | **~2.1s** |
+| **Yi-Coder 9B** | 63.8% | **81.4%** | **~1.8s** |
 
-*(Note: IFEval Instruction Following on Qwen 7B also improved from 45.2% to 58.1%)*
+*(Note: Fleet-wide Weklund Tool-Calling score across all 4 resident 5-GPU models is **160/160 = 100.0%**. IFEval Instruction Following on Qwen 7B also improved from 45.2% to 58.1%.)*
 
 #### 2. HumanEval (Code Gen) Across Weight Classes
 *A distributed benchmark run highlighting the cognitive load effects of the Dual-Engine constraint across different parameter sizes.*
@@ -88,30 +94,27 @@ The Krusch Agentic Proxy acts as a structural safety net. By forcing the model t
 | **Qwen 2.5 Coder 0.5B** | **47.0%** | 26.2% | 📉 *-20.8%* |
 
 > [!WARNING]
-> **The Small-Model Cognitive Penalty:** The Dual-Engine Proxy is a massive multiplier for capable 7B-14B models. However, **it penalizes small models (≤ 3B).** The cognitive load of formatting the massive `<holodata>` JSON "Thinker" blueprint actually distracts the smaller models. They become so hyper-focused on escaping JSON brackets correctly that their core reasoning degrades. **Do not route 3B or sub-3B models through the proxy.**
+> **The Small-Model Cognitive Penalty:** The Dual-Engine Proxy is a massive multiplier for capable 7B-30B models. However, **it penalizes small models (≤ 3B).** The cognitive load of formatting the massive `<holodata>` JSON "Thinker" blueprint distracts smaller models. **Do not route 3B or sub-3B models through the proxy.**
 
-## 🤝 The DBOS Agentic Ecosystem
+## 🤝 The Krusch 3-Tier & DBOS Agentic Ecosystem
 
-This project is a dedicated node within the **Krusch DBOS Agentic Ecosystem**. The architecture moves away from monolithic local applications into a highly modular, distributed swarm of specialized Model Context Protocol (MCP) servers.
+This project operates within the **Krusch Homelab Agentic Ecosystem**, working alongside:
 
-- **[Krusch DBOS MCP](https://github.com/kruschdev/krusch-dbos-mcp)**: The central Orchestrator and Postgres-backed state machine.
-- **[Krusch Agentic Proxy](https://github.com/kruschdev/krusch-agentic-mcp)**: The Intelligence Layer (LLM Waterfall Router).
-- **[PG-Git MCP](https://github.com/kruschdev/pg-git)**: Source Control Boundary (Code Editing & Commits).
-- **[Krusch Infra MCP](https://github.com/kruschdev/krusch-infra-mcp)**: System Ops Boundary (Docker & SRE).
-- **[Signet MCP](https://github.com/kruschdev/signet)**: Communications Boundary (Email & Calendar).
-- **[Krusch Memory MCP](https://github.com/kruschdev/krusch-memory-mcp)**: Episodic History Boundary (Project-isolated Temporal Memory).
-
-> 🗺️ **Want to see the big picture?** Read the [Ecosystem Blueprint](https://github.com/kruschdev/krusch-dbos-mcp/blob/main/ECOSYSTEM.md) for a complete diagram of how these boundaries fit together.
+- **`krusch-context-mcp`**: Tier 1 Working Memory, Invariant Steering & Decision Lineage (`.agent/context.db`).
+- **`krusch-git`**: Tier 2A Git DAG, AST Symbol Graphs & Hybrid RRF Semantic Search (`:4890`).
+- **`krusch-fs`**: Tier 2B Multi-Node OS Filesystem & Page-Anchored Memory across all 8 fleet nodes.
+- **`krusch-harness`**: Tier 3 Staged Execution, PostgreSQL 2PC Apply Journal & `:3778` Control Bridge.
+- **`jean-sre`**: Autonomous 24/7 Fleet SRE Daemon (`kruschdev:3005`).
 
 ---
 
 ## 🚀 Quick Start Guide
 
-### 1. Setup TabbyAPI / Ollama
-Ensure you have a local model running on `http://127.0.0.1:5000/v1` (e.g., TabbyAPI with `Qwen2.5-Coder-7B-Instruct-exl2`).
+### 1. Ensure Ollama is Running on Your Fleet Node(s)
+Ensure local Ollama is serving on `http://127.0.0.1:11434/v1/chat/completions` (e.g., `qwen2.5-coder:7b` on `krusch`, `gemma4:e4b` / `hermes3:latest` on `kruschserv` `10.10.10.2:11434`, and `qwen3-coder-30b-moe:latest` on `kruschdev` `10.10.10.1:11434`).
 
-### 2. Install the MCP Server
-Clone the repository and install it via `uv` or `pip`:
+### 2. Install or Launch the Proxy Services
+Start both the Active Gateway (`:5440`) and Passive OpenClaw Interceptor (`:5443`):
 
 ```bash
 git clone https://github.com/kruschdev/krusch_agentic_proxy.git

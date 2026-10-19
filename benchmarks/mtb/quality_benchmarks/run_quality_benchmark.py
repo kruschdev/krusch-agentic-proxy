@@ -4,12 +4,24 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
-import pandas as pd
-from tqdm import tqdm
+try:
+    import pandas as pd
+except ImportError:
+    pd = None  # type: ignore
 
-from mtb.llm_benchmarks.models.base import ModelSpec
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):  # type: ignore
+        return iterable
+
+try:
+    from mtb.llm_benchmarks.models.base import ModelSpec
+except ImportError:
+    ModelSpec = Any  # type: ignore
+
 from mtb.quality_benchmarks.eval_problems import EVAL_PROBLEMS, EvalProblem
 from mtb.quality_benchmarks.sandbox import SandboxResult, execute_code
 from mtb.quality_benchmarks.tool_call_parser import parse_tool_calls
