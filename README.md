@@ -6,6 +6,7 @@
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
 ![FastMCP](https://img.shields.io/badge/FastMCP-005571?style=flat)
 ![Version: 0.4.0](https://img.shields.io/badge/Version-0.4.0-green.svg)
+[![HOL Guard Catalog](https://img.shields.io/badge/HOL_Guard-Catalog_Listed-0B0F17?logo=shield&logoColor=00F5D4)](https://hol.org/guard/extension-studio?extension=mcp.krusch-agentic-proxy)
 
 **Krusch Agentic MCP (v0.4.0)** is a standalone Model Context Protocol (MCP) server and OpenAI-compatible API gateway that transforms local-first LLMs (like `qwen2.5-coder:7b`, `gemma4:e4b`, and `qwen3-coder-30b-moe`) into highly reliable, structured execution nodes for autonomous agents. Equipped with non-blocking cached PostgreSQL RAG memory injection, connection-pooled HTTP transport, hardened tool sandboxing, and Multi-Family 5-GPU Fleet hardware routing.
 
