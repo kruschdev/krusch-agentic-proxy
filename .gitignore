@@ -38,3 +38,5 @@ config.json
 config.*.json
 config_*.json
 !config.example.json
+*INFLIGHT.md
+.agent/

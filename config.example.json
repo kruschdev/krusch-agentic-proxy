@@ -6,15 +6,15 @@
   },
   "waterfall_routes": [
     {
-      "name": "KruschServ Non-Qwen Pool (Primary Fallback)",
-      "api_url": "http://10.10.10.2:11434/v1/chat/completions",
+      "name": "Local Non-Qwen Diversity Pool (Primary Fallback)",
+      "api_url": "http://127.0.0.1:11434/v1/chat/completions",
       "model": "gemma4:e4b",
       "api_key": "ENV:LOCAL_API_KEY"
     },
     {
       "name": "OpenRouter (Cloud Fallback)",
       "api_url": "https://openrouter.ai/api/v1/chat/completions",
-      "models": ["google/gemini-2.5-flash", "anthropic/claude-3.5-haiku", "meta-llama/llama-3.3-70b-instruct"],
+      "models": ["google/gemini-3.1-flash-lite", "google/gemini-4-argon", "anthropic/claude-3-7-sonnet"],
       "api_key": "ENV:OPENROUTER_API_KEY"
     }
   ]

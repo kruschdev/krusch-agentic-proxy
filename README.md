@@ -34,10 +34,10 @@ Krusch Agentic MCP features a resilient **Waterfall Auto-Routing** proxy. You ca
 Version 0.4.0 synchronizes the proxy with the **Multi-Family 5-GPU Local LLM Runtime Policy** and hardens memory retrieval:
 
 - **Non-Blocking Cached PostgreSQL RAG Hook:** Intercepts domain keywords (prioritizing specific subsystems like `jean`, `dbos`, `vulkan`, `systemd`, `postgres`) and retrieves episodic lessons and nuggets via `asyncio.to_thread` with a bounded 60s TTL LRU cache (`_RAG_CACHE`) and zero hardcoded credentials (`KRUSCH_RAG_DSN` / `DATABASE_URL`).
-- **Multi-Family 5-GPU Fleet Routing:**
-  - **`kruschdev` (`10.10.10.1:11434`, Dual RTX 2080 Ti 22.5GB NVLink):** Routes heavy MoE and reasoning models (`qwen3-coder-30b-moe:latest`, `deepseek-r1:14b`).
-  - **`kruschserv` (`10.10.10.2:11434`, Dual RTX 3060 24.5GB):** Routes the non-Qwen diversity pool (`gemma4:e4b`, `hermes3:latest`).
-  - **`krusch` (`127.0.0.1:11434` / `192.168.1.13:11434`, Single RTX 2080 Ti 11.2GB):** Routes `qwen2.5-coder:7b` for fast local coding/tool routing and `bge-large:latest` for fleet embeddings.
+- **Multi-Family GPU Fleet Routing:**
+  - **Heavy Reasoning Pool (`KRUSCHDEV_OLLAMA_URL`, Dual GPU Node):** Routes heavy MoE and reasoning models (`qwen3-coder-30b-moe:latest`, `deepseek-r1:14b`).
+  - **Non-Qwen Diversity Pool (`KRUSCHSERV_OLLAMA_URL`, Secondary GPU Node):** Routes the non-Qwen diversity pool (`gemma4:e4b`, `hermes3:latest`).
+  - **Primary Local Pool (`KRUSCH_OLLAMA_URL`, default `127.0.0.1:11434`):** Routes `qwen2.5-coder:7b` for fast local coding/tool routing and `bge-large:latest` for embeddings.
 
 
 ### 🔄 Dual Integration Modes (MCP vs API Proxy)
@@ -112,7 +112,7 @@ This project operates within the **Krusch Homelab Agentic Ecosystem**, working a
 ## 🚀 Quick Start Guide
 
 ### 1. Ensure Ollama is Running on Your Fleet Node(s)
-Ensure local Ollama is serving on `http://127.0.0.1:11434/v1/chat/completions` (e.g., `qwen2.5-coder:7b` on `krusch`, `gemma4:e4b` / `hermes3:latest` on `kruschserv` `10.10.10.2:11434`, and `qwen3-coder-30b-moe:latest` on `kruschdev` `10.10.10.1:11434`).
+Ensure local Ollama is serving on `http://127.0.0.1:11434/v1/chat/completions` (or configure `KRUSCH_OLLAMA_URL`, `KRUSCHSERV_OLLAMA_URL`, and `KRUSCHDEV_OLLAMA_URL` for multi-node GPU routing).
 
 ### 2. Install or Launch the Proxy Services
 Start both the Active Gateway (`:5440`) and Passive OpenClaw Interceptor (`:5443`):

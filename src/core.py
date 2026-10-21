@@ -237,12 +237,12 @@ def get_ollama_url_for_model(
     model: str, base_url: str = "http://127.0.0.1:11434/v1/chat/completions"
 ) -> str:
     """
-    Dynamically routes a model to the authoritative 2026-10-18 5-GPU Fleet node:
-      - kruschdev (Dual RTX 2080 Ti 22.5GB NVLink, 192.168.1.240 / 10.10.10.1:11434):
+    Dynamically routes a model across configured Multi-Family GPU Fleet endpoints:
+      - Heavy 30B MoE / Reasoning Pool (`KRUSCHDEV_OLLAMA_URL`):
         qwen3-coder-30b-moe:latest and heavy 14B-32B reasoning models.
-      - kruschserv (Dual RTX 3060 24.5GB, 192.168.1.225 / 10.10.10.2:11434):
-        non-Qwen diversity pool (gemma4:e4b, hermes3:latest).
-      - krusch (Single RTX 2080 Ti 11.2GB, 127.0.0.1 / 192.168.1.13:11434):
+      - Non-Qwen Diversity Pool (`KRUSCHSERV_OLLAMA_URL`):
+        gemma4:e4b, hermes3:latest.
+      - Primary Local Pool (`KRUSCH_OLLAMA_URL` or `base_url`):
         bge-large:latest embeddings and qwen2.5-coder:7b local assistant.
     """
     model_lower = (model or "").lower()
@@ -255,7 +255,7 @@ def get_ollama_url_for_model(
 
     use_10gbe = _use_10gbe_mesh()
 
-    # 1. Heavy 30B MoE / Reasoner Pool -> kruschdev (Dual RTX 2080 Ti NVLink)
+    # 1. Heavy 30B MoE / Reasoner Pool
     kruschdev_keywords = ("30b", "31b", "32b", "deepseek-r1:14b", "r1:14b", "qwen3-coder-30b")
     if any(kw in model_lower for kw in kruschdev_keywords):
         default_dev_ip = "10.10.10.1" if use_10gbe else "192.168.1.240"
@@ -264,7 +264,7 @@ def get_ollama_url_for_model(
             f"http://{default_dev_ip}:11434/v1/chat/completions",
         )
 
-    # 2. Non-Qwen Diversity Pool -> kruschserv (Dual RTX 3060 24GB)
+    # 2. Non-Qwen Diversity Pool
     kruschserv_keywords = ("gemma4", "hermes3")
     if any(kw in model_lower for kw in kruschserv_keywords):
         default_serv_ip = "10.10.10.2" if use_10gbe else "192.168.1.225"
@@ -273,7 +273,7 @@ def get_ollama_url_for_model(
             f"http://{default_serv_ip}:11434/v1/chat/completions",
         )
 
-    # 3. Local 7B Coder & Embeddings -> krusch (or configured base_url)
+    # 3. Local 7B Coder & Embeddings
     return os.environ.get("KRUSCH_OLLAMA_URL", base_url)
 
 
