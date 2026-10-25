@@ -32,6 +32,7 @@ except ImportError:
             raise RuntimeError("The 'mcp' package is required to run the stdio MCP server.")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.config import DEFAULT_MODEL, DEFAULT_OLLAMA_API_URL, load_config
 from src.core import KruschEngine, parse_tool_calls
 from src.tools import INTERNAL_TOOLS, execute_internal_tool
 
@@ -39,24 +40,6 @@ logger = logging.getLogger(__name__)
 
 # Initialize the MCP Server
 mcp = FastMCP("KruschAgenticMCP", dependencies=["httpx", "pydantic"])
-
-
-def load_config() -> Dict[str, Any]:
-    try:
-        config_path = os.environ.get(
-            "KRUSCH_PROXY_CONFIG",
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json"),
-        )
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {
-            "llm": {
-                "model": "qwen2.5-coder:7b",
-                "api_url": "http://127.0.0.1:11434/v1/chat/completions",
-            }
-        }
-
 
 config = load_config()
 krusch_engine = KruschEngine(config)

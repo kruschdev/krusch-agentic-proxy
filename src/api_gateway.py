@@ -30,58 +30,76 @@ from src.core import (
     parse_tool_calls,
     select_relevant_tools,
 )
-from src.models import ChatCompletionRequest
+from pydantic import ValidationError
+from src.schemas import ChatCompletionRequest, ProxyConfig
 from src.router import WaterfallRouter
 from src.tools import INTERNAL_TOOLS, execute_internal_tool
 
 logger = logging.getLogger(__name__)
 
+import threading
+from src.config import (
+    DEFAULT_MODEL,
+    DEFAULT_OLLAMA_API_URL,
+    RAISE_ON_TOOL_CALL_SERIALIZATION_ERROR,
+    load_config,
+)
+
 # Max wall-clock time for the autonomous agent loop (seconds)
 AGENT_TIMEOUT = float(os.environ.get("KRUSCH_AGENT_TIMEOUT", "120"))
-DEFAULT_OLLAMA_API_URL = "http://127.0.0.1:11434/v1/chat/completions"
-
-
-def load_config() -> Dict[str, Any]:
-    try:
-        config_path = os.environ.get(
-            "KRUSCH_PROXY_CONFIG",
-            os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json"),
-        )
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {
-            "llm": {
-                "model": "qwen2.5-coder:7b",
-                "api_url": DEFAULT_OLLAMA_API_URL,
-            }
-        }
 
 
 # --- Application Lifecycle ---
 _engine: Optional[KruschEngine] = None
 _router: Optional[WaterfallRouter] = None
 _config: Optional[Dict[str, Any]] = None
+# Unified re-entrant lock shared across synchronous and asynchronous initialization paths (BUG-01).
+_init_global_lock = threading.RLock()
+
+
+class ToolCallSerializationError(Exception):
+    """Raised when tool_calls cannot be serialized and RAISE_ON_TOOL_CALL_SERIALIZATION_ERROR is enabled."""
+
+
+_TOOL_CALL_ERROR_SENTINEL = json.dumps({"error": "tool_calls serialization failed"})
+
+
+def _initialize_once() -> None:
+    """Internal once-only initialization helper guarded by _init_global_lock."""
+    global _engine, _router, _config
+    with _init_global_lock:
+        if _config is None:
+            _config = load_config()
+        if _engine is None:
+            _engine = KruschEngine(_config)
+        if _router is None:
+            _router = WaterfallRouter(
+                _config.get("waterfall_routes", []),
+                client=get_http_client(120.0),
+            )
 
 
 def _ensure_initialized() -> None:
-    """Lazy-initialize engine and router if not yet initialized by lifespan."""
-    global _engine, _router, _config
-    if _config is None:
-        _config = load_config()
-    if _engine is None:
-        _engine = KruschEngine(_config)
-    if _router is None:
-        _router = WaterfallRouter(
-            _config.get("waterfall_routes", []),
-            client=get_http_client(120.0),
-        )
+    """Lazy-initialize engine and router synchronously with unified _init_global_lock guard (BUG-01)."""
+    if _config is not None and _engine is not None and _router is not None:
+        return
+    with _init_global_lock:
+        if _config is not None and _engine is not None and _router is not None:
+            return
+        _initialize_once()
+
+
+async def _ensure_initialized_async() -> None:
+    """Concurrency-safe async singleton initialization delegating to unified _init_global_lock (BUG-01)."""
+    if _config is not None and _engine is not None and _router is not None:
+        return
+    await asyncio.to_thread(_ensure_initialized)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize engine and router on startup, clean up HTTP pool on shutdown."""
-    _ensure_initialized()
+    await _ensure_initialized_async()
     logger.info("[Gateway] Engine and WaterfallRouter initialized.")
     yield
     await close_http_client()
@@ -122,6 +140,22 @@ def _estimate_tokens(text: Optional[str]) -> int:
     return max(1, len(text) // 4)
 
 
+def _safe_serialize_tool_calls(tool_calls: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    """Safely serialize tool_calls to JSON string, returning None when falsy or structured error sentinel on failure (BUG-02)."""
+    if not tool_calls:
+        return None
+    try:
+        return json.dumps(tool_calls)
+    except (TypeError, ValueError) as exc:
+        if RAISE_ON_TOOL_CALL_SERIALIZATION_ERROR:
+            raise ToolCallSerializationError(f"tool_calls serialization failed: {exc}") from exc
+        logger.warning(
+            "[Gateway] Failed to JSON-serialize tool_calls (%s); returning error payload.",
+            exc,
+        )
+        return _TOOL_CALL_ERROR_SENTINEL
+
+
 def _build_response(
     model: str,
     content: Optional[str],
@@ -130,16 +164,23 @@ def _build_response(
     prompt_text: str = "",
 ) -> Dict[str, Any]:
     """Build a standard OpenAI-compatible response dict including usage statistics."""
-    msg: Dict[str, Any] = {"role": "assistant", "content": content}
+    normalized_content: Optional[str] = content if content is not None else ("" if not tool_calls else None)
+    msg: Dict[str, Any] = {"role": "assistant", "content": normalized_content}
     if tool_calls:
         msg["content"] = None
         msg["tool_calls"] = tool_calls
 
     prompt_tokens = _estimate_tokens(prompt_text)
-    completion_basis = content if content is not None else (json.dumps(tool_calls) if tool_calls else "")
+    serialized_tools = _safe_serialize_tool_calls(tool_calls) if content is None else None
+    has_tool_error = serialized_tools == _TOOL_CALL_ERROR_SENTINEL
+    completion_basis = (
+        content
+        if content is not None
+        else ("" if (has_tool_error or not serialized_tools) else serialized_tools)
+    )
     completion_tokens = _estimate_tokens(completion_basis)
 
-    return {
+    resp: Dict[str, Any] = {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -151,6 +192,9 @@ def _build_response(
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+    if has_tool_error:
+        resp["tool_calls_error"] = "tool_calls serialization failed"
+    return resp
 
 
 def _build_sse_response(
@@ -164,7 +208,7 @@ def _build_sse_response(
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     prompt_tokens = _estimate_tokens(prompt_text)
-    completion_basis = content if content is not None else (json.dumps(tool_calls) if tool_calls else "")
+    completion_basis = content if content is not None else _safe_serialize_tool_calls(tool_calls)
     completion_tokens = _estimate_tokens(completion_basis)
 
     delta: Dict[str, Any] = {"role": "assistant"}
@@ -615,6 +659,21 @@ async def v1_models():
     try:
         host_part = _get_ollama_host()
         resp = await client.get(f"{host_part}/v1/models")
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    except Exception as e:
+        return JSONResponse(
+            content={"error": f"Failed to forward to Ollama: {str(e)}"}, status_code=502
+        )
+
+
+@app.post("/api/embed")
+async def api_embed(request: Request):
+    """Forward modern batched /api/embed request to fleet embedding host (krusch)."""
+    body = await request.json()
+    client = get_http_client(60.0)
+    try:
+        host_part = _get_ollama_host(for_embeddings=True)
+        resp = await client.post(f"{host_part}/api/embed", json=body, timeout=60.0)
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
     except Exception as e:
         return JSONResponse(

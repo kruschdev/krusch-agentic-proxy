@@ -93,6 +93,7 @@ _DANGEROUS_CURL_FLAGS: Set[str] = {
 # --- SECURITY: Filesystem Read Restrictions ---
 DEFAULT_ALLOWED_ROOTS = [
     os.path.expanduser("~"),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "/tmp",
 ]
 

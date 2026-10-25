@@ -12,16 +12,14 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from src.exceptions import ConfigurationError, RouteConfigurationError, resolve_api_key
+
 logger = logging.getLogger(__name__)
 
 
-def resolve_api_key(raw_key: str) -> str:
-    """Resolve an API key, supporting ENV: prefix for environment variable lookup."""
-    if not raw_key:
-        return ""
-    if raw_key.startswith("ENV:"):
-        return os.environ.get(raw_key[4:].strip(), "")
-    return raw_key
+def validate_api_key(raw_key: str) -> str:
+    """Resolve and strictly validate a non-empty API key."""
+    return resolve_api_key(raw_key, strict=True)
 
 
 class WaterfallRouter:
@@ -35,10 +33,12 @@ class WaterfallRouter:
         routes: List[Dict[str, Any]],
         timeout: float = 120.0,
         client: Optional[httpx.AsyncClient] = None,
+        strict_routes: bool = False,
     ):
         self.routes = routes or []
         self.timeout = timeout
         self._client = client
+        self.strict_routes = strict_routes
 
     async def route_chat(
         self,
@@ -50,19 +50,36 @@ class WaterfallRouter:
         """
         Route a simple chat completion through the waterfall and return the content string.
         Used by the internal KruschEngine client for LLM calls.
-        Raises RuntimeError if all routes fail.
+        Raises ConfigurationError / RuntimeError if all routes fail.
         """
         if not self.routes:
-            raise RuntimeError("No waterfall_routes configured for auto-cloud routing.")
+            raise ConfigurationError("No waterfall_routes configured for auto-cloud routing.")
 
         last_error = ""
+        attempted_any = False
 
         for route in self.routes:
             route_name = route.get("name", "Unknown")
             api_url = route.get("api_url")
             if not api_url:
-                last_error = f"Route {route_name} missing api_url"
+                msg = f"Route {route_name} missing required field 'api_url'"
+                logger.warning(f"[Waterfall] {msg}")
+                if self.strict_routes:
+                    raise RouteConfigurationError(msg)
+                last_error = msg
                 continue
+
+            raw_key = route.get("api_key", "")
+            api_key = resolve_api_key(raw_key)
+            if "api_key" in route and not api_key:
+                msg = f"Route {route_name} has empty or unresolved api_key"
+                logger.error(f"[Waterfall] {msg}")
+                if self.strict_routes:
+                    raise ConfigurationError(msg)
+                last_error = msg
+                continue
+
+            attempted_any = True
             logger.info(f"[Waterfall] Trying route: {route_name}")
 
             payload: Dict[str, Any] = {
@@ -79,7 +96,6 @@ class WaterfallRouter:
             elif "model" in route:
                 payload["model"] = route["model"]
 
-            api_key = resolve_api_key(route.get("api_key", ""))
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
@@ -104,6 +120,8 @@ class WaterfallRouter:
                 last_error = str(e)
                 logger.warning(f"[Waterfall] Route {route_name} exception: {last_error}")
 
+        if not attempted_any and "missing required field 'api_url'" in last_error:
+            raise RouteConfigurationError(f"All waterfall routes failed. Last error: {last_error}")
         raise RuntimeError(f"All waterfall routes failed. Last error: {last_error}")
 
     async def route_proxy(
@@ -128,7 +146,8 @@ class WaterfallRouter:
             api_url = route.get("api_url")
             route_name = route.get("name", "Unknown Route")
             if not api_url:
-                last_error = f"Route {route_name} missing api_url"
+                last_error = f"Route {route_name} missing required field 'api_url'"
+                logger.warning(f"[Waterfall] {last_error}")
                 continue
             logger.info(f"[Waterfall] Attempting route: {route_name} ({api_url})")
 
@@ -138,7 +157,13 @@ class WaterfallRouter:
             elif "model" in route:
                 payload["model"] = route["model"]
 
-            api_key = resolve_api_key(route.get("api_key", ""))
+            raw_key = route.get("api_key", "")
+            api_key = resolve_api_key(raw_key)
+            if "api_key" in route and not api_key:
+                last_error = f"Route {route_name} has empty or unresolved api_key"
+                logger.error(f"[Waterfall] {last_error}")
+                continue
+
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",

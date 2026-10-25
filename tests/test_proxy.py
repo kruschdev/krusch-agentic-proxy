@@ -31,7 +31,13 @@ from src.core import (
     retrieve_homelab_context,
     strip_thinking_and_fences,
 )
-from src.router import WaterfallRouter, resolve_api_key
+from src.router import (
+    ConfigurationError,
+    RouteConfigurationError,
+    WaterfallRouter,
+    resolve_api_key,
+    validate_api_key,
+)
 from src.tools import _is_command_allowed, _is_path_allowed, execute_internal_tool
 
 
@@ -234,13 +240,15 @@ def test_path_isolation_and_sensitive_dotfile_blocking(tmp_path, monkeypatch):
     safe_file.write_text("hello safe world", encoding="utf-8")
     assert _is_path_allowed(str(safe_file)) is True
 
-    # Sensitive files inside allowed root must be blocked
+    # Sensitive files inside allowed root must be blocked (generate dynamic test token to avoid hardcoded secret literals)
+    import secrets
+    test_secret = secrets.token_hex(16)
     env_file = tmp_path / ".env"
-    env_file.write_text("SECRET=123", encoding="utf-8")
+    env_file.write_text(f"SECRET={test_secret}", encoding="utf-8")
     assert _is_path_allowed(str(env_file)) is False
 
     env_prod = tmp_path / ".env.production"
-    env_prod.write_text("SECRET=123", encoding="utf-8")
+    env_prod.write_text(f"SECRET={test_secret}", encoding="utf-8")
     assert _is_path_allowed(str(env_prod)) is False
 
     ssh_dir = tmp_path / ".ssh"
@@ -332,6 +340,25 @@ def test_waterfall_router_failover_and_env_key(monkeypatch):
         result = await router.route_chat("sys", "user")
         assert result == "Fallback succeeded"
         assert mock_client.post.call_count == 2
+
+    asyncio.run(_run())
+
+
+def test_waterfall_router_configuration_errors(monkeypatch):
+    monkeypatch.delenv("MISSING_CLOUD_KEY", raising=False)
+    with pytest.raises(ConfigurationError):
+        validate_api_key("ENV:MISSING_CLOUD_KEY")
+    with pytest.raises(ConfigurationError):
+        validate_api_key("")
+
+    async def _run():
+        empty_router = WaterfallRouter([])
+        with pytest.raises(ConfigurationError):
+            await empty_router.route_chat("sys", "user")
+
+        missing_url_router = WaterfallRouter([{"name": "BrokenRoute"}], strict_routes=True)
+        with pytest.raises(RouteConfigurationError):
+            await missing_url_router.route_chat("sys", "user")
 
     asyncio.run(_run())
 
@@ -1043,4 +1070,43 @@ def test_proxy_06_07_08_09_11_locks_failover_502_truncated_think_and_max_loops(m
     asyncio.run(_run_mcp_guard())
 
 
+def test_bug_01_and_bug_02_config_error_handling_and_singleton_lock(monkeypatch, tmp_path):
+    import src.api_gateway as gw
 
+    # BUG-01: Missing config logs error and falls back to DEFAULT_MODEL (or raises in strict mode)
+    missing_cfg = tmp_path / "nonexistent_config.json"
+    monkeypatch.setenv("KRUSCH_PROXY_CONFIG", str(missing_cfg))
+    cfg = gw.load_config(strict=False)
+    assert cfg["llm"]["model"] == gw.DEFAULT_MODEL
+
+    with pytest.raises(FileNotFoundError):
+        gw.load_config(strict=True)
+
+    bad_cfg = tmp_path / "corrupt.json"
+    bad_cfg.write_text("{invalid json", encoding="utf-8")
+    monkeypatch.setenv("KRUSCH_PROXY_CONFIG", str(bad_cfg))
+    with pytest.raises(json.JSONDecodeError):
+        gw.load_config(strict=True)
+
+    # BUG-01 (Lap 3): Valid JSON missing required 'llm' block fails ProxyConfig validation
+    from pydantic import ValidationError
+
+    invalid_schema_cfg = tmp_path / "invalid_schema.json"
+    invalid_schema_cfg.write_text('{"waterfall_routes": []}', encoding="utf-8")
+    monkeypatch.setenv("KRUSCH_PROXY_CONFIG", str(invalid_schema_cfg))
+    fallback_cfg = gw.load_config(strict=False)
+    assert fallback_cfg["llm"]["model"] == gw.DEFAULT_MODEL
+    with pytest.raises(ValidationError):
+        gw.load_config(strict=True)
+
+    # BUG-02: Concurrent _ensure_initialized_async calls safely initialize singletons once
+    async def _run_concurrent_init():
+        await asyncio.gather(
+            gw._ensure_initialized_async(),
+            gw._ensure_initialized_async(),
+            gw._ensure_initialized_async(),
+        )
+        assert gw._engine is not None
+        assert gw._router is not None
+
+    asyncio.run(_run_concurrent_init())

@@ -86,3 +86,34 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionChoice]
     usage: Optional[ChatCompletionUsage] = None
+
+
+class LLMConfig(BaseModel):
+    """Schema for primary LLM configuration block."""
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str = Field(..., min_length=1)
+    api_url: str = Field(..., min_length=1)
+    temperature: Optional[float] = Field(default=0.1, ge=0.0, le=2.0)
+
+
+class WaterfallRouteConfig(BaseModel):
+    """Schema for waterfall route configuration entry."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: Optional[str] = None
+    api_url: str = Field(..., min_length=1)
+    model: str = Field(..., min_length=1)
+    api_key: Optional[str] = None
+
+
+class ProxyConfig(BaseModel):
+    """Top-level proxy configuration schema (BUG-01)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    llm: LLMConfig
+    waterfall_routes: Optional[List[WaterfallRouteConfig]] = None
+

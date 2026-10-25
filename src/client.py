@@ -12,12 +12,13 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-from src.router import WaterfallRouter, resolve_api_key
+from src.exceptions import ConfigurationError, resolve_api_key
 
 logger = logging.getLogger(__name__)
 
 _THINK_TAG_RE = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL)
 DEFAULT_LOCAL_OLLAMA_URL = "http://127.0.0.1:11434/v1/chat/completions"
+
 
 # Shared connection pool for low-latency persistent keep-alive connections
 _shared_client: Optional[httpx.AsyncClient] = None
@@ -53,10 +54,14 @@ async def chat(system_prompt: str, user_message: str, config: Dict[str, Any]) ->
     temperature = config.get("temperature", 0.1)
     max_tokens = config.get("max_tokens", 2048)
 
-    # Waterfall routing for cloud fallback
+    # Waterfall routing for cloud fallback (injected router or lazy resolver)
     if model == "auto-cloud" or os.environ.get("USE_AUTO_CLOUD") == "1":
-        routes = config.get("waterfall_routes", [])
-        router = WaterfallRouter(routes, timeout=120.0, client=get_http_client(120.0))
+        router = config.get("router")
+        if router is None:
+            from src.router import WaterfallRouter as _WaterfallRouter
+
+            routes = config.get("waterfall_routes", [])
+            router = _WaterfallRouter(routes, timeout=120.0, client=get_http_client(120.0))
         raw_content = await router.route_chat(
             system_prompt=system_prompt,
             user_message=user_message,
@@ -66,11 +71,12 @@ async def chat(system_prompt: str, user_message: str, config: Dict[str, Any]) ->
         return _THINK_TAG_RE.sub("", raw_content or "").strip()
 
     # Standard single-endpoint execution with fleet node failover
-    api_key = config.get("api_key", "sk-none")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {resolve_api_key(api_key)}",
-    }
+    api_key = config.get("api_key") if "api_key" in config else os.environ.get("KRUSCH_LLM_API_KEY")
+    if ("api_key" in config or config.get("require_api_key")) and not api_key:
+        raise ConfigurationError("API key missing or empty")
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {resolve_api_key(api_key)}"
 
     base_payload: Dict[str, Any] = {
         "model": model,

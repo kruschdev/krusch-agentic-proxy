@@ -1,5 +1,7 @@
 """Run quality evaluation benchmarks to measure reasoning accuracy across quantizations."""
 
+from __future__ import annotations
+
 import json
 import math
 import time

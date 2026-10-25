@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import os
 from pathlib import Path
 from typing import Union
@@ -8,6 +9,24 @@ from transformers.utils.logging import disable_progress_bar, enable_progress_bar
 from mtb import DEFAULT_HF_HOME
 
 hf_home = os.environ.get("HF_HOME", DEFAULT_HF_HOME)
+
+
+@contextmanager
+def temporary_hf_home(new_path: Union[str, Path]):
+    """Temporarily set HF_HOME and module hf_home inside a context manager (DX-01)."""
+    global hf_home
+    old_env = os.environ.get("HF_HOME")
+    old_hf_home = hf_home
+    hf_home = str(new_path)
+    os.environ["HF_HOME"] = hf_home
+    try:
+        yield hf_home
+    finally:
+        hf_home = old_hf_home
+        if old_env is None:
+            os.environ.pop("HF_HOME", None)
+        else:
+            os.environ["HF_HOME"] = old_env
 
 
 def set_hf_home(
