@@ -37,7 +37,7 @@ Version 0.4.0 synchronizes the proxy with the **Multi-Family 5-GPU Local LLM Run
 - **Multi-Family GPU Fleet Routing:**
   - **Heavy Reasoning Pool (`KRUSCHDEV_OLLAMA_URL`, Dual GPU Node):** Routes heavy MoE and reasoning models (`qwen3-coder-30b-moe:latest`, `deepseek-r1:14b`).
   - **Non-Qwen Diversity Pool (`KRUSCHSERV_OLLAMA_URL`, Secondary GPU Node):** Routes the non-Qwen diversity pool (`gemma4:e4b`, `hermes3:latest`).
-  - **Primary Local Pool (`KRUSCH_OLLAMA_URL`, default `127.0.0.1:11434`):** Routes `qwen2.5-coder:7b` for fast local coding/tool routing and `bge-large:latest` for embeddings.
+  - **Primary Local Pool (`KRUSCH_OLLAMA_URL`, default `127.0.0.1:11434`):** Routes `qwen2.5-coder:7b` for fast local coding/tool routing and `snowflake-arctic-embed2:latest` (`8K` ctx, `1024d`) for embeddings.
 
 
 ### 🔄 Dual Integration Modes (MCP vs API Proxy)
