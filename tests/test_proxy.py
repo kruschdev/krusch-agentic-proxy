@@ -1110,3 +1110,142 @@ def test_bug_01_and_bug_02_config_error_handling_and_singleton_lock(monkeypatch,
         assert gw._router is not None
 
     asyncio.run(_run_concurrent_init())
+
+
+def test_raw_rag_multiturn_compaction_and_sqlite_cross_encoder_rerank(monkeypatch, tmp_path):
+    """
+    Verify arXiv:2610.30755 (Raw-RAG) integration in krusch-agentic-proxy:
+      1. Short conversations (<= budget) pass through byte-for-byte with 0 compaction overhead.
+      2. Long multi-turn sessions (> budget) pin SYSTEM directives + recent tail turns verbatim,
+         and recall buried early facts (ports, deploy IDs) with 0 LLM ingestion calls inside budget.
+      3. FastAPI /v1/chat/completions injects recalled archival evidence into the upstream prompt.
+      4. Tier-1 SQLite memory retrieval uses Stage-2 cross-encoder reranking across Top-32 candidates
+         so older exact multi-term invariants outrank newer generic entries.
+    """
+    import sqlite3
+
+    from src.core import compact_messages_with_raw_rag
+
+    # 1. Short conversation no-op
+    short_msgs = [
+        {"role": "system", "content": "Always respond concisely."},
+        {"role": "user", "content": "What is 2 + 2?"},
+    ]
+    short_res = compact_messages_with_raw_rag(short_msgs, query="What is 2 + 2?", max_history_tokens=5000)
+    assert short_res["compacted"] is False
+    assert short_res["messages"] == short_msgs
+    assert short_res["llm_ingestion_calls"] == 0
+
+    # 2. Long 45-turn session exceeding budget with buried needle at Turn #1
+    long_msgs = [
+        {"role": "system", "content": "STRICT SYSTEM INVARIANT: Never drop system instructions."},
+        {
+            "role": "user",
+            "content": (
+                "Record this critical infrastructure anchor: the staging PostgreSQL pool on "
+                "kruschdev listens on port 5439 with deployment ticket KDP-9941."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "Confirmed: staging PostgreSQL pool on kruschdev port 5439 (ticket KDP-9941).",
+        },
+    ]
+    filler_block = " ".join(f"routine_telemetry_metric_{w}" for w in range(120))
+    for turn_idx in range(40):
+        long_msgs.append({"role": "user", "content": f"Check batch {turn_idx}: {filler_block}"})
+        long_msgs.append({"role": "assistant", "content": f"Batch {turn_idx} nominal: {filler_block}"})
+
+    final_question = "Which port does the staging PostgreSQL pool on kruschdev use and what was the KDP ticket?"
+    long_msgs.append({"role": "user", "content": final_question})
+
+    compacted = compact_messages_with_raw_rag(
+        long_msgs,
+        query=final_question,
+        max_history_tokens=1800,
+        recent_tail_turns=3,
+    )
+    assert compacted["compacted"] is True
+    assert compacted["llm_ingestion_calls"] == 0
+    assert compacted["original_tokens"] > 8000
+    assert compacted["compacted_tokens"] <= 2000
+    assert compacted["recalled_windows"] >= 1
+    assert compacted["messages"][0]["content"] == "STRICT SYSTEM INVARIANT: Never drop system instructions."
+    assert compacted["messages"][-1]["content"] == final_question
+    serialized_compacted = "\n".join(str(m.get("content", "")) for m in compacted["messages"])
+    assert "5439" in serialized_compacted
+    assert "KDP-9941" in serialized_compacted
+
+    # 3. End-to-end FastAPI /v1/chat/completions forwards compacted Raw-RAG prompt
+    monkeypatch.setenv("KRUSCH_RAW_RAG_BUDGET_TOKENS", "1800")
+    captured_prompts = []
+
+    async def fake_generate(prompt, **kwargs):
+        captured_prompts.append(prompt)
+        return "FAST_PATH_DIRECT", "Port 5439 (ticket KDP-9941)"
+
+    client = TestClient(app)
+    with patch("src.api_gateway._engine.generate", side_effect=fake_generate):
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen2.5-coder:7b", "messages": long_msgs},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["choices"][0]["message"]["content"] == "Port 5439 (ticket KDP-9941)"
+        assert len(captured_prompts) == 1
+        assert "STRICT SYSTEM INVARIANT" in captured_prompts[0]
+        assert "RAW-RAG RECALLED" in captured_prompts[0]
+        assert "5439" in captured_prompts[0]
+        assert "KDP-9941" in captured_prompts[0]
+
+    monkeypatch.delenv("KRUSCH_RAW_RAG_BUDGET_TOKENS", raising=False)
+
+    # 4. Tier-1 SQLite Top-32 + Stage-2 Cross-Encoder Reranking surfaces older exact invariant
+    _RAG_CACHE.clear()
+    db_file = tmp_path / "rerank_context.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute("CREATE TABLE ide_agent_nuggets (project TEXT, key TEXT, value TEXT, updated_at TEXT)")
+    conn.execute(
+        "CREATE TABLE ide_agent_memory (project TEXT, category TEXT, content TEXT, tags TEXT, status TEXT, created_at TEXT)"
+    )
+    # Older exact-match invariant (created_at = 2026-10-01)
+    conn.execute(
+        "INSERT INTO ide_agent_memory VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "krusch-agentic-proxy",
+            "invariant",
+            "Postgres HNSW index on kdcode port 5432 requires snowflake-arctic-embed2 1024d vectors.",
+            "postgres,hnsw,5432",
+            "ACTIVE",
+            "2026-10-01T00:00:00Z",
+        ),
+    )
+    # 10 newer generic postgres entries that would displace the invariant under naive LIMIT 5
+    for idx in range(10):
+        conn.execute(
+            "INSERT INTO ide_agent_memory VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "krusch-agentic-proxy",
+                "lesson",
+                f"Generic postgres connection check log entry #{idx} completed.",
+                "postgres",
+                "ACTIVE",
+                f"2026-10-2{idx % 6}T12:00:00Z",
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.delenv("KRUSCH_RAG_DSN", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("DB_PASSWORD", raising=False)
+    monkeypatch.setenv("KRUSCH_CONTEXT_SQLITE", str(db_file))
+
+    reranked_ctx = retrieve_homelab_context(
+        "postgres",
+        project="krusch-agentic-proxy",
+        rerank_query="What vector dimension does the Postgres HNSW index on kdcode port 5432 require?",
+    )
+    assert "snowflake-arctic-embed2 1024d vectors" in reranked_ctx
+    _RAG_CACHE.clear()
+

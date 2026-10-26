@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.client import close_http_client, get_http_client
 from src.core import (
     KruschEngine,
+    compact_messages_with_raw_rag,
     compact_tool_schemas,
     format_tools_for_prompt,
     parse_tool_calls,
@@ -366,12 +367,24 @@ async def chat_completions(request: Request):
             f"Dual-Engine will likely degrade performance due to Cognitive Penalty."
         )
 
+    # --- SOURCE-PRESERVING MULTI-TURN RAW-RAG COMPACTION (arXiv:2610.30755) ---
+    compaction = compact_messages_with_raw_rag(messages, query=str(user_prompt or ""))
+    effective_messages = compaction["messages"]
+    if compaction["compacted"]:
+        logger.info(
+            "[Gateway] Raw-RAG compacted multi-turn history: %d -> %d tokens (%d recalled windows, policy=%s).",
+            compaction["original_tokens"],
+            compaction["compacted_tokens"],
+            compaction["recalled_windows"],
+            compaction["budget_policy"],
+        )
+
     # --- FAST-PATH: Standard NLP ---
     if not is_tool_request and not force_autonomous and not force_dual_engine:
         logger.info("[Gateway] Fast-path routing: Standard NLP request.")
 
         chat_context = ""
-        for msg in messages:
+        for msg in effective_messages:
             role = msg.get("role", "user").upper()
             content = msg.get("content", "")
             chat_context += f"{role}: {content}\n"
@@ -400,7 +413,7 @@ async def chat_completions(request: Request):
     if force_dual_engine and not is_tool_request and not force_autonomous:
         logger.info("[Gateway] Forced Dual-Engine NLP routing active.")
         chat_context = ""
-        for msg in messages:
+        for msg in effective_messages:
             role = msg.get("role", "user").upper()
             content = msg.get("content", "")
             chat_context += f"{role}: {content}\n"
@@ -439,12 +452,12 @@ async def chat_completions(request: Request):
             if msg.get("role", "user").upper() == "USER" and msg.get("content")
         ]
 
-        # PROXY-03: Only exclude messages[-1] if it is the trailing USER message already
+        # PROXY-03: Only exclude effective_messages[-1] if it is the trailing USER message already
         # extracted as latest_objective; preserve trailing TOOL or ASSISTANT messages.
-        if messages and messages[-1].get("role", "").upper() == "USER":
-            history_msgs = messages[:-1]
+        if effective_messages and effective_messages[-1].get("role", "").upper() == "USER":
+            history_msgs = effective_messages[:-1]
         else:
-            history_msgs = list(messages)
+            history_msgs = list(effective_messages)
 
         for msg in history_msgs:
             role = msg.get("role", "user").upper()

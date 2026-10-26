@@ -7,10 +7,13 @@ bounded non-blocking episodic RAG context injection.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import math
 import os
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -18,11 +21,176 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.client import chat
 
+_MONOREPO_LIB_PY = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "lib-py")
+)
+if os.path.isdir(_MONOREPO_LIB_PY) and _MONOREPO_LIB_PY not in sys.path:
+    sys.path.insert(0, _MONOREPO_LIB_PY)
+
+try:
+    from krusch_toolkit.embeddings import cosine_similarity, deterministic_token_vector
+    from krusch_toolkit.raw_rag import (
+        assemble_reader_evidence,
+        chunk_conversation_windows,
+        estimate_token_count,
+        rerank_candidate_windows,
+        score_deterministic_cross_encoder,
+    )
+except ImportError:  # pragma: no cover - standalone CI clone fallback without monorepo lib-py
+    _TOKEN_RE = re.compile(r"\S+")
+    _WORD_RE = re.compile(r"[a-z0-9_#-]+")
+
+    def estimate_token_count(text: str) -> int:
+        return len(_TOKEN_RE.findall(str(text or "")))
+
+    def deterministic_token_vector(text: str, dim: int = 256) -> List[float]:
+        vec = [0.0] * dim
+        tokens = _WORD_RE.findall(str(text or "").lower())
+        for tok in tokens:
+            digest = hashlib.sha256(tok.encode("utf-8")).digest()
+            idx = int.from_bytes(digest[:4], "little") % dim
+            sign = 1.0 if (digest[4] & 1) == 0 else -1.0
+            vec[idx] += sign
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+    def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+        if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+            return 0.0
+        dot = sum(a * b for a, b in zip(vec_a, vec_b))
+        na = math.sqrt(sum(a * a for a in vec_a))
+        nb = math.sqrt(sum(b * b for b in vec_b))
+        return dot / (na * nb) if na and nb else 0.0
+
+    def score_deterministic_cross_encoder(query: str, document: str) -> float:
+        q_tokens = [t for t in _WORD_RE.findall(str(query or "").lower()) if len(t) > 1]
+        d_lower = str(document or "").lower()
+        d_tokens = set(_WORD_RE.findall(d_lower))
+        if not q_tokens or not d_tokens:
+            return 0.0
+        hits = sum(1 for t in set(q_tokens) if t in d_tokens)
+        cov = hits / len(set(q_tokens))
+        q_bigrams = {f"{q_tokens[i]} {q_tokens[i + 1]}" for i in range(len(q_tokens) - 1)}
+        bg = (sum(1 for b in q_bigrams if b in d_lower) / len(q_bigrams)) if q_bigrams else 0.0
+        nums = [t for t in set(q_tokens) if any(ch.isdigit() for ch in t)]
+        num_bonus = 0.15 if nums and all(n in d_tokens for n in nums) else 0.0
+        return min(1.0, 0.65 * cov + 0.25 * bg + num_bonus)
+
+    def chunk_conversation_windows(
+        turns: List[Dict[str, Any]],
+        *,
+        window_tokens: int = 256,
+        overlap_tokens: int = 32,
+    ) -> Dict[str, Any]:
+        serialized: List[Dict[str, Any]] = []
+        all_tokens: List[Tuple[str, int]] = []
+        for idx, t in enumerate(turns):
+            header = f"[{t.get('date') or 'unknown'} | {t.get('speaker') or 'user'}]"
+            full = f"{header}\n{t.get('content') or ''}".strip()
+            toks = _TOKEN_RE.findall(full)
+            serialized.append({"index": idx, "turn_id": t.get("turn_id", f"turn_{idx}"), "text": full, "token_count": len(toks)})
+            for tok in toks:
+                all_tokens.append((tok, idx))
+        stride = max(1, window_tokens - overlap_tokens)
+        windows: List[Dict[str, Any]] = []
+        pos = 0
+        while pos < len(all_tokens):
+            end = min(len(all_tokens), pos + window_tokens)
+            span = all_tokens[pos:end]
+            t_indices = sorted({ti for _, ti in span})
+            text = " ".join(tok for tok, _ in span)
+            windows.append(
+                {
+                    "id": f"raw_win_{len(windows)}",
+                    "window_index": len(windows),
+                    "text": text,
+                    "token_count": len(span),
+                    "turn_indices": t_indices,
+                    "turn_ids": [serialized[i]["turn_id"] for i in t_indices],
+                    "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                }
+            )
+            if end >= len(all_tokens):
+                break
+            pos += stride
+        return {"serialized_turns": serialized, "windows": windows}
+
+    def rerank_candidate_windows(
+        query: str, candidates: List[Dict[str, Any]], *, top_k: int = 15
+    ) -> List[Dict[str, Any]]:
+        scored = [
+            {**c, "rerank_score": score_deterministic_cross_encoder(query, c.get("text", ""))}
+            for c in candidates
+        ]
+        scored.sort(key=lambda x: (-x["rerank_score"], x.get("window_index", 0)))
+        return scored[:top_k]
+
+    def assemble_reader_evidence(
+        reranked_windows: List[Dict[str, Any]],
+        serialized_turns: List[Dict[str, Any]],
+        *,
+        max_evidence_tokens: int = 5000,
+        turn_expansion: bool = True,
+        deduplicate_turns: bool = False,
+        chronological_order: bool = True,
+    ) -> Dict[str, Any]:
+        ordered = (
+            sorted(reranked_windows, key=lambda w: w.get("window_index", 0))
+            if chronological_order
+            else list(reranked_windows)
+        )
+        if turn_expansion and serialized_turns:
+            exp_entries = []
+            seen: Set[int] = set()
+            for w in ordered:
+                for ti in w.get("turn_indices", []):
+                    if deduplicate_turns and ti in seen:
+                        continue
+                    seen.add(ti)
+                    if 0 <= ti < len(serialized_turns):
+                        exp_entries.append(serialized_turns[ti])
+            exp_text = "\n\n".join(e["text"] for e in exp_entries)
+            exp_tokens = estimate_token_count(exp_text)
+            if exp_tokens <= max_evidence_tokens:
+                return {
+                    "context_text": exp_text,
+                    "entries": exp_entries,
+                    "selected_window_count": len(ordered),
+                    "retained_entry_count": len(exp_entries),
+                    "token_count": exp_tokens,
+                    "turn_expansion_applied": True,
+                    "budget_policy_triggered": "NONE",
+                }
+        kept = []
+        used = 0
+        policy = "DISABLED_TURN_EXPANSION" if turn_expansion else "NONE"
+        for w in ordered:
+            wt = w.get("token_count") or estimate_token_count(w.get("text", ""))
+            if used + wt <= max_evidence_tokens:
+                kept.append(w)
+                used += wt
+            else:
+                policy = "PREFIX_COMPLETE_WINDOWS"
+                break
+        return {
+            "context_text": "\n\n".join(w["text"] for w in kept),
+            "entries": kept,
+            "selected_window_count": len(ordered),
+            "retained_entry_count": len(kept),
+            "token_count": used,
+            "turn_expansion_applied": False,
+            "budget_policy_triggered": policy,
+        }
+
+
 logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL)
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_-]*\n(.*?)```", re.DOTALL)
 _HOLODATA_RE = re.compile(r"<holodata>(.*?)</holodata>", re.DOTALL)
+
+DEFAULT_RAW_RAG_BUDGET_TOKENS = 5000
+DEFAULT_RAW_RAG_RECENT_TAIL_TURNS = 4
 
 # Ordered from most specific homelab subsystem keywords to broader terms
 _RAG_KEYWORDS: Tuple[str, ...] = (
@@ -92,11 +260,19 @@ def _resolve_rag_dsn() -> str:
     return ""
 
 
-def _retrieve_sqlite_context(sqlite_path: str, query: str, project: str) -> List[str]:
-    """Read-only Tier 1 SQLite (.agent/context.db) fallback for local homelab RAG."""
+def _retrieve_sqlite_context(
+    sqlite_path: str, query: str, project: str, rerank_query: str = ""
+) -> List[str]:
+    """
+    Read-only Tier 1 SQLite (.agent/context.db) fallback for local homelab RAG.
+    Fetches a wider candidate pool (`Top-32`) and applies deterministic cross-encoder
+    reranking (`arXiv:2610.30755`) before slicing to top 5 so exact multi-term invariants
+    are never displaced by newer generic entries.
+    """
     parts: List[str] = []
     if not sqlite_path or not os.path.isfile(sqlite_path):
         return parts
+    effective_rerank = (rerank_query or query or "").strip()
     try:
         import sqlite3
 
@@ -125,12 +301,29 @@ def _retrieve_sqlite_context(sqlite_path: str, query: str, project: str) -> List
                 WHERE UPPER(status) = 'ACTIVE'
                 AND (project = ? OR project IS NULL OR project = 'global' OR category IN ('invariant', 'decision'))
                 AND (content LIKE ? OR tags LIKE ?)
-                ORDER BY created_at DESC LIMIT 5
+                ORDER BY created_at DESC LIMIT 32
                 """,
                 (project, f"%{query}%", f"%{query}%"),
             )
-            memories = cur.fetchall()
-            if memories:
+            candidates = cur.fetchall()
+            if candidates:
+                if len(candidates) > 1 and effective_rerank:
+                    scored_memories = [
+                        (
+                            float(
+                                score_deterministic_cross_encoder(
+                                    effective_rerank, f"{cat} {tags or ''} {content}"
+                                )
+                            ),
+                            idx,
+                            (cat, content, tags),
+                        )
+                        for idx, (cat, content, tags) in enumerate(candidates)
+                    ]
+                    scored_memories.sort(key=lambda item: (-item[0], item[1]))
+                    memories = [item[2] for item in scored_memories[:5]]
+                else:
+                    memories = candidates[:5]
                 parts.append("\n=== Deep Episodic Lessons & Decisions ===")
                 for cat, content, tags in memories:
                     tags_str = f" [Tags: {tags}]" if tags else ""
@@ -142,7 +335,9 @@ def _retrieve_sqlite_context(sqlite_path: str, query: str, project: str) -> List
     return parts
 
 
-def retrieve_homelab_context(query: str, project: str = "krusch-agentic-proxy") -> str:
+def retrieve_homelab_context(
+    query: str, project: str = "krusch-agentic-proxy", rerank_query: str = ""
+) -> str:
     """
     Zero-Trust database memory retriever with thread-safe bounded TTL caching (PROXY-06).
     Queries global Postgres kruschdb when configured via env, or local Tier-1 SQLite context.db
@@ -151,7 +346,9 @@ def retrieve_homelab_context(query: str, project: str = "krusch-agentic-proxy") 
     if not query or os.environ.get("KRUSCH_DISABLE_RAG") == "1":
         return ""
 
-    cache_key = (project, query.lower())
+    norm_rerank = rerank_query.strip().lower()[:160] if rerank_query else ""
+    cache_id = f"{query.lower()}::{norm_rerank}" if norm_rerank else query.lower()
+    cache_key = (project, cache_id)
     now = time.monotonic()
     with _RAG_CACHE_LOCK:
         cached = _RAG_CACHE.get(cache_key)
@@ -212,7 +409,9 @@ def retrieve_homelab_context(query: str, project: str = "krusch-agentic-proxy") 
             logger.debug(f"[Krusch RAG] Direct Postgres memory retrieval skipped: {e}")
 
     if not context_parts and sqlite_path:
-        context_parts.extend(_retrieve_sqlite_context(sqlite_path, query, project))
+        context_parts.extend(
+            _retrieve_sqlite_context(sqlite_path, query, project, rerank_query=rerank_query)
+        )
 
     result = "\n".join(context_parts) if context_parts else ""
     with _RAG_CACHE_LOCK:
@@ -220,6 +419,221 @@ def retrieve_homelab_context(query: str, project: str = "krusch-agentic-proxy") 
         while len(_RAG_CACHE) > _RAG_CACHE_MAX_SIZE:
             _RAG_CACHE.popitem(last=False)
     return result
+
+
+def _message_to_turn_text(msg: Dict[str, Any]) -> Tuple[str, str]:
+    """Normalize an OpenAI chat message (including multipart content & tool_calls) into (ROLE, text)."""
+    role = str(msg.get("role") or "user").upper()
+    raw_content = msg.get("content")
+    if isinstance(raw_content, list):
+        parts = []
+        for item in raw_content:
+            if isinstance(item, dict):
+                txt = item.get("text") or item.get("content") or ""
+                if txt:
+                    parts.append(str(txt))
+            elif item is not None:
+                parts.append(str(item))
+        text = "\n".join(parts)
+    elif raw_content is None:
+        text = ""
+    else:
+        text = str(raw_content)
+
+    tool_calls_data = msg.get("tool_calls")
+    if role == "ASSISTANT" and isinstance(tool_calls_data, list) and tool_calls_data:
+        tc_lines = []
+        for tc in tool_calls_data:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                fn_name = fn.get("name") or tc.get("name") or "unknown"
+                fn_args = fn.get("arguments") if "arguments" in fn else tc.get("arguments", "{}")
+                tc_lines.append(f"ASSISTANT CALLED TOOL: {fn_name} WITH ARGS: {fn_args}")
+        if tc_lines:
+            text = f"{text}\n" + "\n".join(tc_lines) if text else "\n".join(tc_lines)
+    elif role == "TOOL":
+        label = msg.get("name") or msg.get("tool_call_id") or "unknown"
+        text = f"TOOL RESULT ({label}): {text}"
+
+    return role, text.strip()
+
+
+def compact_messages_with_raw_rag(
+    messages: List[Dict[str, Any]],
+    query: str = "",
+    *,
+    max_history_tokens: Optional[int] = None,
+    recent_tail_turns: int = DEFAULT_RAW_RAG_RECENT_TAIL_TURNS,
+    window_tokens: int = 256,
+    overlap_tokens: int = 32,
+    dense_candidate_k: int = 128,
+    final_rerank_k: int = 15,
+) -> Dict[str, Any]:
+    """
+    Source-Preserving Multi-Turn Episodic Compaction (`Raw-RAG`, arXiv:2610.30755):
+      - Short-circuits as an exact zero-overhead no-op when total message tokens <= max_history_tokens
+        (default 5,000, configurable via KRUSCH_RAW_RAG_BUDGET_TOKENS; set <=0 to disable).
+      - When long multi-turn sessions exceed budget, pins SYSTEM/DEVELOPER prompts + recent tail turns
+        verbatim, and indexes archival turns with 0 LLM calls (`256/32`-token sliding windows +
+        `Top-128` dense recall + `Top-15` cross-encoder reranking + graceful turn-expansion fallback),
+        preventing Ollama left-truncation from dropping early constraints, IDs, or tool results.
+    """
+    if max_history_tokens is None:
+        try:
+            max_history_tokens = int(
+                os.environ.get("KRUSCH_RAW_RAG_BUDGET_TOKENS", str(DEFAULT_RAW_RAG_BUDGET_TOKENS))
+            )
+        except ValueError:
+            max_history_tokens = DEFAULT_RAW_RAG_BUDGET_TOKENS
+
+    safe_messages = list(messages or [])
+    serialized_pairs = [_message_to_turn_text(m) for m in safe_messages]
+    original_tokens = sum(estimate_token_count(txt) + 4 for _, txt in serialized_pairs)
+
+    if (
+        max_history_tokens <= 0
+        or original_tokens <= max_history_tokens
+        or len(safe_messages) <= max(1, recent_tail_turns) + 1
+    ):
+        return {
+            "compacted": False,
+            "messages": safe_messages,
+            "original_tokens": original_tokens,
+            "compacted_tokens": original_tokens,
+            "recalled_windows": 0,
+            "budget_policy": "NONE",
+            "llm_ingestion_calls": 0,
+        }
+
+    pinned_system: List[Dict[str, Any]] = []
+    conversational: List[Tuple[int, Dict[str, Any], str, str]] = []
+    for idx, (msg, (role, txt)) in enumerate(zip(safe_messages, serialized_pairs)):
+        if role in ("SYSTEM", "DEVELOPER"):
+            pinned_system.append(msg)
+        else:
+            conversational.append((idx, msg, role, txt))
+
+    safe_tail = max(1, int(recent_tail_turns))
+    if len(conversational) <= safe_tail:
+        return {
+            "compacted": False,
+            "messages": safe_messages,
+            "original_tokens": original_tokens,
+            "compacted_tokens": original_tokens,
+            "recalled_windows": 0,
+            "budget_policy": "NONE",
+            "llm_ingestion_calls": 0,
+        }
+
+    archival = conversational[:-safe_tail]
+    recent_tail = [item[1] for item in conversational[-safe_tail:]]
+
+    effective_query = (query or "").strip()
+    if not effective_query:
+        for _, _, r_role, r_txt in reversed(conversational[-safe_tail:]):
+            if r_role == "USER" and r_txt:
+                effective_query = r_txt
+                break
+        if not effective_query and conversational:
+            effective_query = conversational[-1][3]
+
+    raw_turns = [
+        {
+            "turn_id": f"turn_{orig_idx}",
+            "date": f"turn-{orig_idx}",
+            "speaker": role.lower(),
+            "content": txt,
+        }
+        for orig_idx, _, role, txt in archival
+        if txt
+    ]
+
+    chunked = chunk_conversation_windows(
+        raw_turns, window_tokens=window_tokens, overlap_tokens=overlap_tokens
+    )
+    windows = chunked["windows"]
+    serialized_turns = chunked["serialized_turns"]
+
+    if not windows:
+        return {
+            "compacted": False,
+            "messages": safe_messages,
+            "original_tokens": original_tokens,
+            "compacted_tokens": original_tokens,
+            "recalled_windows": 0,
+            "budget_policy": "NONE",
+            "llm_ingestion_calls": 0,
+        }
+
+    # Stage 1: Wide feature-hashed dense candidate pool (Top-128)
+    if len(windows) > dense_candidate_k and effective_query:
+        q_vec = deterministic_token_vector(effective_query, dim=256)
+        dense_scored = [
+            (
+                cosine_similarity(q_vec, deterministic_token_vector(w["text"], dim=256)),
+                w["window_index"],
+                w,
+            )
+            for w in windows
+        ]
+        dense_scored.sort(key=lambda item: (-item[0], item[1]))
+        candidate_pool = [item[2] for item in dense_scored[:dense_candidate_k]]
+    else:
+        candidate_pool = windows
+
+    # Stage 2: Cross-encoder rerank (Top-15)
+    reranked = rerank_candidate_windows(
+        effective_query, candidate_pool, top_k=final_rerank_k
+    )
+
+    # Stage 3: Graceful token-budget assembly (disables turn expansion before dropping chunks)
+    pinned_tokens = sum(
+        estimate_token_count(_message_to_turn_text(m)[1]) + 4
+        for m in (pinned_system + recent_tail)
+    )
+    archival_budget = max(256, max_history_tokens - pinned_tokens)
+    assembled = assemble_reader_evidence(
+        reranked,
+        serialized_turns,
+        max_evidence_tokens=archival_budget,
+        turn_expansion=True,
+        deduplicate_turns=False,
+        chronological_order=True,
+    )
+
+    recalled_count = int(
+        assembled.get("selected_window_count")
+        or assembled.get("retained_entry_count")
+        or len(assembled.get("entries", []))
+    )
+
+    compacted_messages: List[Dict[str, Any]] = list(pinned_system)
+    if assembled["context_text"]:
+        compacted_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f"[ARCHIVED EPISODIC HISTORY — RAW-RAG RECALLED "
+                    f"({recalled_count} windows from {len(archival)} earlier turns, "
+                    f"0 LLM ingestion calls)]\n{assembled['context_text']}"
+                ),
+            }
+        )
+    compacted_messages.extend(recent_tail)
+
+    compacted_tokens = sum(
+        estimate_token_count(_message_to_turn_text(m)[1]) + 4 for m in compacted_messages
+    )
+
+    return {
+        "compacted": True,
+        "messages": compacted_messages,
+        "original_tokens": original_tokens,
+        "compacted_tokens": compacted_tokens,
+        "recalled_windows": recalled_count,
+        "budget_policy": assembled["budget_policy_triggered"],
+        "llm_ingestion_calls": 0,
+    }
 
 
 def _use_10gbe_mesh() -> bool:
@@ -243,7 +657,7 @@ def get_ollama_url_for_model(
       - Non-Qwen Diversity Pool (`KRUSCHSERV_OLLAMA_URL`):
         gemma4:e4b, hermes3:latest.
       - Primary Local Pool (`KRUSCH_OLLAMA_URL` or `base_url`):
-        bge-large:latest embeddings and qwen2.5-coder:7b local assistant.
+        snowflake-arctic-embed2:latest embeddings and qwen2.5-coder:7b local assistant.
     """
     model_lower = (model or "").lower()
 
@@ -575,12 +989,13 @@ class KruschEngine:
         self.unified_execution = bool(llm_conf.get("unified_execution", False))
 
     async def _fetch_rag_context(self, prompt: str) -> str:
-        """Non-blocking RAG retrieval helper."""
+        """Non-blocking RAG retrieval helper with Stage-2 cross-encoder reranking."""
         rag_query = _extract_rag_keyword(prompt)
         if not rag_query:
             return ""
+        rerank_hint = prompt[-500:] if prompt else ""
         retrieved = await asyncio.to_thread(
-            retrieve_homelab_context, rag_query, "krusch-agentic-proxy"
+            retrieve_homelab_context, rag_query, "krusch-agentic-proxy", rerank_hint
         )
         return (
             f"RETRIEVED HOMELAB CONTEXT:\n<homelab_context>\n{retrieved}\n</homelab_context>\n\n"
