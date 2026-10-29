@@ -6,6 +6,8 @@
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
 ![FastMCP](https://img.shields.io/badge/FastMCP-005571?style=flat)
 ![Version: 0.4.0](https://img.shields.io/badge/Version-0.4.0-green.svg)
+[![CI](https://github.com/kruschdev/krusch-agentic-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/kruschdev/krusch-agentic-proxy/actions/workflows/ci.yml)
+![Pytest: 35 passed](https://img.shields.io/badge/pytest-35%20passed-brightgreen.svg)
 [![HOL Guard Catalog](https://img.shields.io/badge/HOL_Guard-Catalog_Listed-0B0F17?logo=shield&logoColor=00F5D4)](https://hol.org/guard/extension-studio?extension=mcp.krusch-agentic-proxy)
 
 **Krusch Agentic MCP (v0.4.0)** is a standalone Model Context Protocol (MCP) server and OpenAI-compatible API gateway that transforms local-first LLMs (like `qwen2.5-coder:7b`, `gemma4:e4b`, and `qwen3-coder-30b-moe`) into highly reliable, structured execution nodes for autonomous agents. Equipped with non-blocking cached PostgreSQL RAG memory injection, connection-pooled HTTP transport, hardened tool sandboxing, and Multi-Family 5-GPU Fleet hardware routing.
@@ -68,15 +70,15 @@ When an unassisted model attempts to generate code or execute tools, it hallucin
 The Krusch Agentic Proxy acts as a structural safety net. By forcing the model through the Dual-Engine (Thinker + Implementer) pipeline, we see massive gains in reliability for capable edge models (7B-14B) without needing a massive LLM.
 
 #### 1. Weklund Tool-Calling Accuracy (`v0.4.0` Verified across 5-GPU Fleet: 2026-10-18)
-*Demonstrating the elimination of hallucinated parameters and complete multi-tool / conditional planning via `v0.4.0` JSON canonicalization (`temperature=0.0`) across all 3 compute nodes (`krusch`, `kruschdev`, `kruschserv`).*
+*Demonstrating the elimination of hallucinated parameters and complete multi-tool / conditional planning via `v0.4.0` JSON canonicalization (`temperature=0.0`) across all 3 multi-family GPU compute pools.*
 
-| Model & Fleet Node | Naked (Baseline) | Krusch Agentic Proxy (`v0.4.0`) | Avg Latency / Task |
+| Model & GPU Pool | Naked (Baseline) | Krusch Agentic Proxy (`v0.4.0`) | Avg Latency / Task |
 | :--- | :--- | :--- | :--- |
-| **Qwen3 Coder 30B MoE** (`kruschdev` Dual RTX 2080 Ti NVLink) | 82.5% | **100.0% (40/40)** | ⚡ **~0.5s** |
-| **Qwen 2.5 Coder 7B** (`krusch` Single RTX 2080 Ti) | 69.1% | **100.0% (40/40)** | ⚡ **~1.4s** |
-| **Google Gemma 4 E4B** (`kruschserv` Dual RTX 3060) | 72.5% | **100.0% (40/40)** | ⚡ **~1.2s** |
-| **Nous Hermes 3** (`kruschserv` Dual RTX 3060) | 70.0% | **100.0% (40/40)** | ⚡ **~1.9s** |
-| **DeepSeek-R1-14B** (`kruschdev` Dual RTX 2080 Ti) | 76.2% | **97.5%** | **~2.1s** |
+| **Qwen3 Coder 30B MoE** (Heavy Pool — Dual RTX 2080 Ti NVLink) | 82.5% | **100.0% (40/40)** | **~0.5s** |
+| **Qwen 2.5 Coder 7B** (Primary Local — Single RTX 2080 Ti) | 69.1% | **100.0% (40/40)** | **~1.4s** |
+| **Google Gemma 4 E4B** (Diversity Pool — Dual RTX 3060) | 72.5% | **100.0% (40/40)** | **~1.2s** |
+| **Nous Hermes 3** (Diversity Pool — Dual RTX 3060) | 70.0% | **100.0% (40/40)** | **~1.9s** |
+| **DeepSeek-R1-14B** (Heavy Pool — Dual RTX 2080 Ti) | 76.2% | **97.5%** | **~2.1s** |
 | **Yi-Coder 9B** | 63.8% | **81.4%** | **~1.8s** |
 
 *(Note: Fleet-wide Weklund Tool-Calling score across all 4 resident 5-GPU models is **160/160 = 100.0%**. IFEval Instruction Following on Qwen 7B also improved from 45.2% to 58.1%.)*
@@ -97,32 +99,53 @@ The Krusch Agentic Proxy acts as a structural safety net. By forcing the model t
 > [!WARNING]
 > **The Small-Model Cognitive Penalty:** The Dual-Engine Proxy is a massive multiplier for capable 7B-30B models. However, **it penalizes small models (≤ 3B).** The cognitive load of formatting the massive `<holodata>` JSON "Thinker" blueprint distracts smaller models. **Do not route 3B or sub-3B models through the proxy.**
 
+---
+
+## ⚙️ Production Agentic Systems & `/v1/*` Gateway Modules
+
+In addition to OpenAI-compatible `/v1/chat/completions`, `krusch-agentic-proxy` bundles six deterministic production agentic subsystems (see [**Paper #23 — The 15 Production Agentic Systems**](https://krusch.dev/articles/fifteen-production-agent-systems) for full state-machine teardowns and invariants):
+
+| Subsystem | Module | Core Guarantee & FastAPI Endpoint |
+| :--- | :--- | :--- |
+| **1. Async Agent Orchestrator** | `src/orchestrator.py` (`AsyncAgentOrchestrator`, `HostCircuitBreaker`) | Executes `100+` concurrent agent tasks via `asyncio.Semaphore(128)`, offloads synchronous tools via `asyncio.to_thread` so the event loop never stalls, and isolates faulty upstreams with per-host `CLOSED → OPEN → HALF_OPEN` circuit breakers (`POST /v1/orchestrate/batch`). |
+| **2. Dynamic Context Budget Assembler** | `src/budget_assembler.py` (`DynamicContextBudgetAssembler`) | Strict pre-flight token allocator across system prompts, ranked tool schemas, retrieved documents, and chronological message history guaranteeing `total_allocated_tokens <= input_ceiling_tokens` (`POST /v1/context/budget`). |
+| **3. Strict Pydantic v2 Tool Router** | `src/pydantic_tool_router.py` (`StrictPydanticToolRouter`) | Compiles OpenAI/MCP JSON Schemas into `ConfigDict(extra="forbid")` Pydantic v2 models (`json_schema_to_pydantic_model`) and automatically feeds structured validation traces back to the model for up to `3` self-repair retries (`POST /v1/tools/execute-strict`). |
+| **4. Typed Multi-Agent Swarm** | `src/typed_swarm.py` (`TypedMultiAgentSwarm`) | Deterministic `RESEARCH → CODE → REVIEW → APPROVED \| REJECTED` state machine passing frozen Pydantic v2 handoff objects (`ResearchBrief`, `CodeArtifact`, `ReviewVerdict`)—raising `TypeError` on any raw text handoff (`POST /v1/swarm/run`). |
+| **5. `$0.50` Cost Kill-Switch Middleware** | `src/cost_killswitch.py` (`CostKillSwitch`) | Tracks per-session `loop_depth` and projected token spend; downgrades paid frontier calls to `$0.00` sovereign local `qwen2.5-coder:7b` before breaching `$0.50` and hard-halts paid spend at `$0.50` (`POST /v1/cost/evaluate`). |
+| **6. 5% Shadow Trajectory Comparator** | `src/shadow_comparator.py` (`ShadowTrajectoryComparator`) | Non-blocking `asyncio.create_task` `5%` traffic mirror computing dynamic-programming Levenshtein tool-sequence edit distance, argument-key Jaccard similarity, latency delta, and cost delta in SQLite WAL (`GET /v1/shadow/comparisons`). |
+
+---
+
 ## 🤝 The Krusch 3-Tier & DBOS Agentic Ecosystem
 
-This project operates within the **Krusch Homelab Agentic Ecosystem**, working alongside:
+This project operates within the **Krusch Agentic Ecosystem**, working alongside:
 
-- **`krusch-context-mcp`**: Tier 1 Working Memory, Invariant Steering & Decision Lineage (`.agent/context.db`).
-- **`krusch-git`**: Tier 2A Git DAG, AST Symbol Graphs & Hybrid RRF Semantic Search (`:4890`).
-- **`krusch-fs`**: Tier 2B Multi-Node OS Filesystem & Page-Anchored Memory across all 8 fleet nodes.
-- **`krusch-harness`**: Tier 3 Staged Execution, PostgreSQL 2PC Apply Journal & `:3778` Control Bridge.
-- **`jean-sre`**: Autonomous 24/7 Fleet SRE Daemon (`kruschdev:3005`).
+- **[`krusch-stack`](https://github.com/kruschdev/krusch-stack)**: Unified 7-pillar 39-tool MCP, CLI (`npx krusch-stack`), and zero-dep resilience gateway (`:3780`).
+- **[`krusch-context-mcp`](https://github.com/kruschdev/krusch-context-mcp)**: Tier 1 Working Memory, Invariant Steering & Decision Lineage (`.agent/context.db`).
+- **[`krusch-git`](https://github.com/kruschdev/krusch-git)**: Tier 2A Git DAG, AST Symbol Graphs & Hybrid RRF Semantic Search (`:4890`).
+- **[`krusch-fs-mcp`](https://github.com/kruschdev/krusch-fs-mcp)**: Tier 2B Multi-Node OS Filesystem & Page-Anchored Memory.
+- **[`krusch-coding-harness`](https://github.com/kruschdev/krusch-coding-harness)**: Tier 3 Staged Execution, PostgreSQL 2PC Apply Journal, 100-Trajectory Golden DAG CI Gate & `:3778` Control Bridge.
+- **[`Jean SRE`](https://github.com/kruschdev/Jean-SRE-by-kruschdev)**: Autonomous 24/7 Fleet SRE Daemon (`:3005`).
 
 ---
 
 ## 🚀 Quick Start Guide
 
-### 1. Ensure Ollama is Running on Your Fleet Node(s)
+### 1. Ensure Ollama is Running on Your Compute Node(s)
 Ensure local Ollama is serving on `http://127.0.0.1:11434/v1/chat/completions` (or configure `KRUSCH_OLLAMA_URL`, `KRUSCHSERV_OLLAMA_URL`, and `KRUSCHDEV_OLLAMA_URL` for multi-node GPU routing).
 
-### 2. Install or Launch the Proxy Services
+### 2. Install & Run Tests
 Start both the Active Gateway (`:5440`) and Passive OpenClaw Interceptor (`:5443`):
 
 ```bash
-git clone https://github.com/kruschdev/krusch_agentic_proxy.git
-cd krusch_agentic_proxy
+git clone https://github.com/kruschdev/krusch-agentic-proxy.git
+cd krusch-agentic-proxy
 
-# Install via pip
-pip install -e .
+# Install via pip (including pytest dev extras)
+pip install -e ".[dev]"
+
+# Verify all 35 unit & production agentic system tests
+pytest -q
 ```
 
 ### 3. Configure
@@ -163,6 +186,7 @@ When connected, the server exposes the following tool to your parent agent:
 ### `krusch_execute_task(objective: str)`
 Delegates a complex, multi-step objective or tool-calling task to the Krusch Dual-Engine reasoning model. The sub-agent will autonomously execute shell commands and read files to satisfy the objective before returning a final answer.
 
-## 📈 Benchmarking
+## 📈 Benchmarking & Architecture Reference
 
-To verify the structural accuracy and view the complete methodology for reproducing these results on your own hardware using the EleutherAI LM Evaluation Harness, please see the [Benchmarks & Evaluation](BENCHMARKS.md) documentation.
+- [Benchmarks & Evaluation](BENCHMARKS.md) — Weklund Tool-Calling & HumanEval reproduction methodology.
+- [Paper #23: The 15 Production Agentic Systems](https://krusch.dev/articles/fifteen-production-agent-systems) — Reference architecture, state-machine invariants, and benchmark proofs across the sovereign stack.

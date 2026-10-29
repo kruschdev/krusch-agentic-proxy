@@ -308,8 +308,13 @@ def test_cost_killswitch_and_shadow_comparator_and_gateway_routes(monkeypatch, t
     comp = ShadowTrajectoryComparator(db_path=shadow_db, sample_rate=0.05)
 
     async def _verify_shadow_non_blocking():
+        release_gate = asyncio.Event()
+        candidate_finished = False
+
         async def slow_candidate():
-            await asyncio.sleep(0.08)
+            nonlocal candidate_finished
+            await release_gate.wait()
+            candidate_finished = True
             return {
                 "tool_calls": [
                     {"name": "read_file", "arguments": {"path": "a.py"}},
@@ -334,9 +339,12 @@ def test_cost_killswitch_and_shadow_comparator_and_gateway_routes(monkeypatch, t
             force=True,
         )
         dispatch_ms = (time.perf_counter() - t0) * 1000.0
-        assert dispatch_ms < 20.0  # Main request thread returns immediately without awaiting 80ms shadow
         assert task is not None
+        assert candidate_finished is False  # Deterministic proof: returned without awaiting shadow_runner
+        assert dispatch_ms < 250.0
+        release_gate.set()
         await comp.flush_pending()
+        assert candidate_finished is True
         rows = comp.list_recent(limit=5)
         assert len(rows) == 1
         assert rows[0]["exact_dag_match"] is True
