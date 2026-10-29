@@ -77,3 +77,19 @@
    - `start_proxies.sh` and `stop_proxies.sh` MUST manage both the Active Universal Gateway (`:5440`, `gateway_5440.pid`) and the Passive OpenClaw Interceptor (`:5443`, `PASSIVE_MODE=1`, `gateway_5443.pid` / `nvidia.pid`).
    - `benchmark.sh` MUST default to `MODEL="${MODEL:-qwen2.5-coder:7b}"` rather than the obsolete `krusch-brain` model identifier, and `benchmarks/run_humaneval*.py` (`run_humaneval.py`, `run_humaneval_gemma4_tier.py`, `run_humaneval_9b_tier.py`, `run_humaneval_14b_tier.py`) MUST include `SCRIPT_DIR` on `sys.path` and route to the 2026-10-18 5-GPU Fleet endpoints.
 
+
+---
+
+## 4. Phase 3 Enhancements (v0.5.0 — Production Agentic Systems Parity, FROZEN 2026-10-28)
+
+10. **`INV-10` (`src/orchestrator.py` — 100+ Concurrent Async Agent Orchestrator)**:
+    - `AsyncAgentOrchestrator` MUST execute `100+` concurrent agent tasks on a single `asyncio` event loop using `asyncio.Semaphore(max_concurrency)`, per-task `asyncio.wait_for` timeouts, exponential-jitter retry, non-blocking tool execution (`asyncio.iscoroutinefunction` or `asyncio.to_thread`), and per-host circuit breakers (`CLOSED` / `OPEN` / `HALF_OPEN`).
+11. **`INV-11` (`src/budget_assembler.py` — Pre-Flight Dynamic Context Budget Assembler)**:
+    - `DynamicContextBudgetAssembler` MUST strictly allocate `max_context_tokens - output_reserve_tokens` across `system_prompt`, `tool_schemas`, `retrieved_docs`, and `conversation_history`, deterministically evicting lowest-salience docs and lowest-relevance non-pinned tools on overflow and emitting a `ContextBudgetLedger`.
+12. **`INV-12` (`src/pydantic_tool_router.py` — Strict Pydantic v2 Tool Router & Validation Retry)**:
+    - `StrictPydanticToolRouter` MUST validate every tool argument payload against a strict Pydantic v2 `BaseModel` (`extra="forbid"`), formatting `ValidationError` / `JSONDecodeError` traces into structured repair prompts and retrying up to `max_retries=3`.
+13. **`INV-13` (`src/typed_swarm.py` — Strictly Typed Multi-Agent Swarm State Machine)**:
+    - `TypedMultiAgentSwarm` (`RESEARCH` -> `CODE` -> `REVIEW` -> `APPROVED` | `REJECTED` with bounded `REVIEW -> CODE` revisions) MUST pass frozen Pydantic v2 models (`ResearchBrief`, `CodeArtifact`, `ReviewVerdict`, `SwarmState`) and raise `TypeError` if raw `str` handoffs are attempted.
+14. **`INV-14` (`src/shadow_comparator.py` & `src/cost_killswitch.py` — 5% Shadow Comparator & `$0.50` Cost Kill-Switch)**:
+    - `ShadowTrajectoryComparator` MUST mirror `sample_rate` (default `0.05`) requests via fire-and-forget `asyncio.create_task` (`0 ms` user blocking), persisting tool-call Levenshtein/Jaccard diff & cost/latency deltas to SQLite WAL (`shadow_comparisons`).
+    - `CostKillSwitch` MUST enforce `hard_limit_usd = 0.50`, automatically downgrading paid frontier calls to `$0.00` local Ollama (`qwen2.5-coder:7b` / `qwen3-coder-30b-moe:latest`) when projected spend breaches the ceiling and halting (`HALTED_BUDGET_EXCEEDED`) if paid spend reaches `$0.50` or `loop_depth > max_loop_depth`.

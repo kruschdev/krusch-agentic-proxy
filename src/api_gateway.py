@@ -32,9 +32,15 @@ from src.core import (
     select_relevant_tools,
 )
 from pydantic import ValidationError
+from src.budget_assembler import DynamicContextBudgetAssembler
+from src.cost_killswitch import CostKillSwitch
+from src.orchestrator import AgentTaskSpec, AsyncAgentOrchestrator
+from src.pydantic_tool_router import StrictPydanticToolRouter
 from src.schemas import ChatCompletionRequest, ProxyConfig
 from src.router import WaterfallRouter
+from src.shadow_comparator import ShadowTrajectoryComparator
 from src.tools import INTERNAL_TOOLS, execute_internal_tool
+from src.typed_swarm import TypedMultiAgentSwarm
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +60,15 @@ AGENT_TIMEOUT = float(os.environ.get("KRUSCH_AGENT_TIMEOUT", "120"))
 _engine: Optional[KruschEngine] = None
 _router: Optional[WaterfallRouter] = None
 _config: Optional[Dict[str, Any]] = None
+_cost_killswitch = CostKillSwitch(
+    hard_limit_usd=float(os.environ.get("KRUSCH_COST_HARD_LIMIT_USD", "0.50")),
+    max_loop_depth=int(os.environ.get("KRUSCH_MAX_LOOP_DEPTH", "12")),
+    fallback_model=os.environ.get("KRUSCH_FALLBACK_MODEL", "qwen2.5-coder:7b"),
+)
+_shadow_comparator = ShadowTrajectoryComparator(
+    db_path=os.environ.get("KRUSCH_SHADOW_DB", ":memory:"),
+    sample_rate=float(os.environ.get("KRUSCH_SHADOW_SAMPLE_RATE", "0.05")),
+)
 # Unified re-entrant lock shared across synchronous and asynchronous initialization paths (BUG-01).
 _init_global_lock = threading.RLock()
 
@@ -113,9 +128,29 @@ app = FastAPI(title="Krusch Agentic Proxy (OpenAI API)", version="0.4.0", lifesp
 @app.middleware("http")
 async def verify_api_key_middleware(request: Request, call_next):
     """
-    Optional Bearer token verification middleware when KRUSCH_PROXY_API_KEY is set (PROXY-02).
-    Exempts /health for liveness probes.
+    Enforces bounded request payload size (413 Payload Too Large) and optional
+    Bearer token verification when KRUSCH_PROXY_API_KEY is set (PROXY-02).
+    Exempts /health from auth for liveness probes.
     """
+    if request.method in ("POST", "PUT", "PATCH"):
+        max_bytes = max(1024, int(os.environ.get("KRUSCH_MAX_REQUEST_BYTES", str(2 * 1024 * 1024))))
+        cl_header = request.headers.get("content-length")
+        if cl_header is not None:
+            try:
+                if int(cl_header) > max_bytes:
+                    return JSONResponse(
+                        {"error": f"Payload Too Large: exceeds {max_bytes} byte limit."},
+                        status_code=413,
+                    )
+            except ValueError:
+                return JSONResponse({"error": "Invalid Content-Length header."}, status_code=400)
+        raw_body = await request.body()
+        if len(raw_body) > max_bytes:
+            return JSONResponse(
+                {"error": f"Payload Too Large: exceeds {max_bytes} byte limit."},
+                status_code=413,
+            )
+
     required_key = os.environ.get("KRUSCH_PROXY_API_KEY", "").strip()
     if required_key and request.url.path != "/health":
         auth_header = request.headers.get("Authorization", "")
@@ -312,6 +347,37 @@ async def chat_completions(request: Request):
     messages = [msg.model_dump(exclude_none=True) for msg in validated.messages]
     model = validated.model or _config.get("llm", {}).get("model", "qwen2.5-coder:7b")
 
+    # --- OPTIONAL SESSION COST KILL-SWITCH & LOCAL FALLBACK (#12) ---
+    session_id = (
+        request.headers.get("X-Session-Id", "").strip()
+        or str(raw_data.get("session_id") or "").strip()
+    )
+    if session_id:
+        ks_decision = _cost_killswitch.evaluate_pre_call(
+            session_id,
+            model=model,
+            estimated_prompt_tokens=_estimate_tokens(json.dumps(messages)),
+            max_completion_tokens=validated.max_tokens or 2048,
+        )
+        if not ks_decision.allowed:
+            status_code = 429 if ks_decision.action == "HALTED_MAX_DEPTH" else 402
+            return JSONResponse(
+                {
+                    "error": ks_decision.reason,
+                    "killswitch": ks_decision.model_dump(),
+                },
+                status_code=status_code,
+            )
+        if ks_decision.action == "FALLBACK_LOCAL":
+            logger.warning(
+                "[Gateway] CostKillSwitch downgraded session %s: %s -> %s (%s)",
+                session_id,
+                model,
+                ks_decision.effective_model,
+                ks_decision.reason,
+            )
+            model = ks_decision.effective_model
+
     # --- WATERFALL AUTO-CLOUD ROUTING ---
     if model == "auto-cloud" or os.environ.get("USE_AUTO_CLOUD") == "1":
         logger.info("[Gateway] 'auto-cloud' detected. Intercepting for Waterfall Auto-Routing.")
@@ -379,6 +445,15 @@ async def chat_completions(request: Request):
             compaction["budget_policy"],
         )
 
+    def _record_session_spend(prompt_str_used: str, completion_str_used: Optional[str]) -> None:
+        if session_id:
+            _cost_killswitch.record_usage(
+                session_id,
+                model=model,
+                prompt_tokens=_estimate_tokens(prompt_str_used),
+                completion_tokens=_estimate_tokens(completion_str_used or ""),
+            )
+
     # --- FAST-PATH: Standard NLP ---
     if not is_tool_request and not force_autonomous and not force_dual_engine:
         logger.info("[Gateway] Fast-path routing: Standard NLP request.")
@@ -402,6 +477,7 @@ async def chat_completions(request: Request):
             logger.error(f"[Gateway] Upstream LLM failure in standard NLP: {e}")
             return JSONResponse({"error": f"Upstream LLM failure: {str(e)}"}, status_code=502)
 
+        _record_session_spend(chat_context, response_text)
         return _format_completion_response(
             model=model,
             content=response_text,
@@ -435,6 +511,7 @@ async def chat_completions(request: Request):
         if blueprint:
             combined = f"<holodata>\n{blueprint}\n</holodata>\n\n{response_text}"
 
+        _record_session_spend(chat_context, combined)
         return _format_completion_response(
             model=model,
             content=combined,
@@ -506,6 +583,7 @@ async def chat_completions(request: Request):
             "CURRENT OBJECTIVE. Follow the CRITICAL RULES from the system prompt exactly."
         )
 
+        t_primary0 = time.perf_counter()
         try:
             _, response_text = await _engine.generate(
                 prompt=prompt_str,
@@ -519,6 +597,8 @@ async def chat_completions(request: Request):
         except RuntimeError as e:
             logger.error(f"[Gateway] Upstream LLM failure in Tool-Calling Mode: {e}")
             return JSONResponse({"error": f"Upstream LLM failure: {str(e)}"}, status_code=502)
+        primary_latency_ms = max(0.001, (time.perf_counter() - t_primary0) * 1000.0)
+        _record_session_spend(prompt_str, response_text)
 
         if not provided_tools:
             return _format_completion_response(
@@ -545,6 +625,50 @@ async def chat_completions(request: Request):
         ]
 
         if openai_tool_calls:
+            force_shadow = request.headers.get("X-Krusch-Shadow", "").strip().lower() == "force"
+            if force_shadow or os.environ.get("KRUSCH_SHADOW_ENABLED") == "1":
+                shadow_model = request.headers.get("X-Krusch-Shadow-Model") or os.environ.get(
+                    "KRUSCH_SHADOW_MODEL", "gemma4:e4b"
+                )
+                req_id = request.headers.get("X-Request-Id") or f"req-{uuid.uuid4().hex[:12]}"
+
+                async def _run_shadow() -> Dict[str, Any]:
+                    t0 = time.perf_counter()
+                    _, s_text = await _engine.generate(
+                        prompt=prompt_str,
+                        is_code_exec=False,
+                        is_tool_call=True,
+                        exact_signature="",
+                        target_model=shadow_model,
+                        max_tokens=validated.max_tokens or 2048,
+                        temperature=0.1,
+                    )
+                    s_calls, _ = parse_tool_calls(s_text)
+                    return {
+                        "tool_calls": s_calls,
+                        "latency_ms": (time.perf_counter() - t0) * 1000.0,
+                        "cost_usd": _cost_killswitch.estimate_cost_usd(
+                            shadow_model,
+                            _estimate_tokens(prompt_str),
+                            _estimate_tokens(s_text),
+                        ),
+                    }
+
+                _shadow_comparator.schedule_background_shadow(
+                    request_id=req_id,
+                    primary_model=model,
+                    shadow_model=shadow_model,
+                    primary_calls=openai_tool_calls,
+                    primary_latency_ms=primary_latency_ms,
+                    primary_cost_usd=_cost_killswitch.estimate_cost_usd(
+                        model,
+                        _estimate_tokens(prompt_str),
+                        _estimate_tokens(response_text),
+                    ),
+                    shadow_runner=_run_shadow,
+                    force=force_shadow,
+                )
+
             return _format_completion_response(
                 model=model,
                 content=None,
@@ -590,6 +714,7 @@ async def chat_completions(request: Request):
                 max_tokens=2048,
                 temperature=0.1,
             )
+            _record_session_spend(chat_history, response_text)
 
             tool_calls, fallback_msg = parse_tool_calls(response_text)
 
@@ -737,6 +862,187 @@ async def api_generate(request: Request):
         return JSONResponse(
             content={"error": f"Failed to forward to Ollama: {str(e)}"}, status_code=502
         )
+
+
+# --- Agentic Production Systems Endpoints (#1, #2, #3, #6, #12, #14) ---
+
+
+@app.post("/v1/orchestrate/batch")
+async def v1_orchestrate_batch(request: Request):
+    """Execute 100+ concurrent async agent tasks with non-blocking tools and per-host circuit breakers (#1)."""
+    try:
+        body = await request.json()
+        raw_tasks = body.get("tasks", [])
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            return JSONResponse({"error": "'tasks' must be a non-empty list."}, status_code=400)
+        max_batch_tasks = max(1, int(os.environ.get("KRUSCH_MAX_BATCH_TASKS", "1000")))
+        if len(raw_tasks) > max_batch_tasks:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"'tasks' count ({len(raw_tasks)}) exceeds maximum batch limit "
+                        f"({max_batch_tasks})."
+                    )
+                },
+                status_code=400,
+            )
+        max_concurrency = max(1, min(512, int(body.get("max_concurrency", 128))))
+        specs = [AgentTaskSpec.model_validate(item) for item in raw_tasks]
+    except Exception as exc:
+        return JSONResponse({"error": f"Invalid batch payload: {exc}"}, status_code=400)
+
+    orchestrator = AsyncAgentOrchestrator(max_concurrency=max_concurrency)
+    report = await orchestrator.run_batch(specs, batch_id=body.get("batch_id"))
+    return JSONResponse(report.model_dump())
+
+
+@app.post("/v1/context/budget")
+async def v1_context_budget(request: Request):
+    """Pre-flight strict 3-bucket + history token budget allocator (#2)."""
+    try:
+        body = await request.json()
+        assembler = DynamicContextBudgetAssembler(
+            max_context_tokens=int(body.get("max_context_tokens", 16384)),
+            output_reserve_tokens=int(body.get("output_reserve_tokens", 2048)),
+            system_cap_ratio=float(body.get("system_cap_ratio", 0.25)),
+            tools_cap_ratio=float(body.get("tools_cap_ratio", 0.20)),
+            docs_cap_ratio=float(body.get("docs_cap_ratio", 0.35)),
+        )
+        package = assembler.assemble(
+            system_prompt=str(body.get("system_prompt", "")),
+            query=str(body.get("query", "")),
+            docs=body.get("docs") or [],
+            tools=body.get("tools") or [],
+            messages=body.get("messages") or [],
+        )
+        return JSONResponse(package.model_dump())
+    except Exception as exc:
+        return JSONResponse({"error": f"Invalid budget request: {exc}"}, status_code=400)
+
+
+@app.post("/v1/tools/execute-strict")
+async def v1_tools_execute_strict(request: Request):
+    """Strict Pydantic v2 JSON-Schema tool router with automatic ValidationError trace retry (#3)."""
+    _ensure_initialized()
+    assert _engine is not None
+    try:
+        body = await request.json()
+        prompt = str(body.get("prompt", "")).strip()
+        tool_name = str(body.get("tool_name", "")).strip()
+        parameters_schema = body.get("parameters_schema")
+        max_retries = max(0, min(5, int(body.get("max_retries", 3))))
+        if not prompt or not tool_name or not isinstance(parameters_schema, dict):
+            return JSONResponse(
+                {"error": "'prompt', 'tool_name', and dict 'parameters_schema' are required."},
+                status_code=400,
+            )
+    except Exception as exc:
+        return JSONResponse({"error": f"Invalid tool request: {exc}"}, status_code=400)
+
+    router = StrictPydanticToolRouter(max_retries=max_retries)
+    router.register_tool(
+        name=tool_name,
+        schema=parameters_schema,
+        handler=lambda **kwargs: {"executed": tool_name, "validated": kwargs},
+        description=str(body.get("description", "")),
+    )
+
+    scripted_outputs = body.get("scripted_llm_outputs")
+    if isinstance(scripted_outputs, list) and scripted_outputs:
+        queue = list(scripted_outputs)
+
+        async def _scripted_llm(_repair_prompt: str) -> str:
+            return str(queue.pop(0) if len(queue) > 1 else queue[0])
+
+        llm_fn = _scripted_llm
+    else:
+        target_model = str(body.get("model") or DEFAULT_MODEL)
+
+        async def _live_llm(repair_prompt: str) -> str:
+            _, text = await _engine.generate(
+                prompt=repair_prompt,
+                is_code_exec=False,
+                is_tool_call=True,
+                target_model=target_model,
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            return text
+
+        llm_fn = _live_llm
+
+    result = await router.execute_with_retry(
+        prompt=prompt,
+        llm_generate_fn=llm_fn,
+        expected_tool=tool_name,
+    )
+    status_code = 200 if result.ok else 422
+    return JSONResponse(result.model_dump(), status_code=status_code)
+
+
+@app.post("/v1/swarm/run")
+async def v1_swarm_run(request: Request):
+    """Run strictly typed Researcher -> Coder -> Reviewer multi-agent state machine (#6)."""
+    try:
+        body = await request.json()
+        objective = str(body.get("objective", "")).strip()
+        if not objective:
+            return JSONResponse({"error": "'objective' must be non-empty."}, status_code=400)
+        max_revisions = max(0, min(5, int(body.get("max_revisions", 2))))
+    except Exception as exc:
+        return JSONResponse({"error": f"Invalid swarm request: {exc}"}, status_code=400)
+
+    swarm = TypedMultiAgentSwarm(max_revisions=max_revisions)
+    state = await swarm.run(objective=objective, task_id=body.get("task_id"))
+    return JSONResponse(state.model_dump())
+
+
+@app.post("/v1/cost/evaluate")
+async def v1_cost_evaluate(request: Request):
+    """Evaluate pre-turn loop depth and $0.50 projected spend kill-switch / local fallback (#12)."""
+    try:
+        body = await request.json()
+        session_id = str(body.get("session_id", "default")).strip() or "default"
+        if body.get("reset"):
+            _cost_killswitch.reset_session(session_id)
+        actual = body.get("record_usage")
+        if isinstance(actual, dict):
+            _cost_killswitch.record_usage(
+                session_id,
+                model=str(actual.get("model", "gemini-4-argon")),
+                prompt_tokens=int(actual.get("prompt_tokens", 0)),
+                completion_tokens=int(actual.get("completion_tokens", 0)),
+            )
+        decision = _cost_killswitch.evaluate_pre_call(
+            session_id,
+            model=str(body.get("model", "gemini-4-argon")),
+            estimated_prompt_tokens=int(body.get("estimated_prompt_tokens", 1000)),
+            max_completion_tokens=int(body.get("max_completion_tokens", 2048)),
+        )
+        return JSONResponse(
+            {
+                "decision": decision.model_dump(),
+                "ledger": _cost_killswitch.get_session_ledger(session_id),
+            },
+            status_code=200 if decision.allowed else 402,
+        )
+    except Exception as exc:
+        return JSONResponse({"error": f"Invalid cost evaluation request: {exc}"}, status_code=400)
+
+
+@app.get("/v1/shadow/comparisons")
+async def v1_shadow_comparisons(request: Request):
+    """Inspect recent silent 5% shadow trajectory comparisons and aggregate metrics (#14)."""
+    if request.query_params.get("flush") == "1":
+        await _shadow_comparator.flush_pending()
+    limit = max(1, min(200, int(request.query_params.get("limit", "50"))))
+    return JSONResponse(
+        {
+            "ok": True,
+            "summary": _shadow_comparator.summary_metrics(),
+            "comparisons": _shadow_comparator.list_recent(limit=limit),
+        }
+    )
 
 
 if __name__ == "__main__":
