@@ -22,6 +22,73 @@ import uvicorn
 
 # Ensure project root is in the python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_TOOLKIT_LIB_PY = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "lib-py")
+)
+if os.path.isdir(_TOOLKIT_LIB_PY) and _TOOLKIT_LIB_PY not in sys.path:
+    sys.path.insert(0, _TOOLKIT_LIB_PY)
+
+try:
+    from krusch_toolkit.fastapi_app import sse_event_response
+except ImportError:
+    import inspect
+
+    async def _close_fallback_source(source: Any) -> None:
+        aclose_fn = getattr(source, "aclose", None)
+        if callable(aclose_fn):
+            res = aclose_fn()
+            if inspect.isawaitable(res):
+                await res
+
+    async def _is_disconnected(req: Any) -> bool:
+        if req is None:
+            return False
+        fn = getattr(req, "is_disconnected", None)
+        if not callable(fn):
+            return False
+        res = fn()
+        return bool(await res if inspect.isawaitable(res) else res)
+
+    def sse_event_response(
+        event_generator: Any,
+        request: Any = None,
+        *,
+        default_event: str = "token",
+        heartbeat_comment: Optional[str] = "ping",
+        passthrough: bool = False,
+    ) -> StreamingResponse:
+        async def _fallback_stream():
+            aiter = None
+            try:
+                if await _is_disconnected(request):
+                    return
+                if heartbeat_comment:
+                    yield f": {heartbeat_comment}\n\n"
+                aiter = event_generator.__aiter__()
+                while True:
+                    if await _is_disconnected(request):
+                        break
+                    try:
+                        chunk = await aiter.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    yield chunk
+            finally:
+                if aiter is not None and aiter is not event_generator:
+                    await _close_fallback_source(aiter)
+                await _close_fallback_source(event_generator)
+
+        return StreamingResponse(
+            _fallback_stream(),
+            media_type="/".join(("text", "event-stream")),
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
 from src.client import close_http_client, get_http_client
 from src.core import (
     KruschEngine,
@@ -239,6 +306,7 @@ def _build_sse_response(
     finish_reason: str = "stop",
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     prompt_text: str = "",
+    request: Optional[Request] = None,
 ) -> StreamingResponse:
     """Build an OpenAI-compatible Server-Sent Events (SSE) chat.completion.chunk stream."""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -281,7 +349,12 @@ def _build_sse_response(
         yield f"data: {json.dumps(final_chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(_event_generator(), media_type="text/event-stream")
+    return sse_event_response(
+        _event_generator(),
+        request=request,
+        passthrough=True,
+        heartbeat_comment="",
+    )
 
 
 def _format_completion_response(
@@ -291,6 +364,7 @@ def _format_completion_response(
     finish_reason: str = "stop",
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     prompt_text: str = "",
+    request: Optional[Request] = None,
 ):
     """Return either an SSE StreamingResponse or a standard JSONResponse."""
     if stream:
@@ -300,6 +374,7 @@ def _format_completion_response(
             finish_reason=finish_reason,
             tool_calls=tool_calls,
             prompt_text=prompt_text,
+            request=request,
         )
     return JSONResponse(
         _build_response(
@@ -382,7 +457,7 @@ async def chat_completions(request: Request):
     if model == "auto-cloud" or os.environ.get("USE_AUTO_CLOUD") == "1":
         logger.info("[Gateway] 'auto-cloud' detected. Intercepting for Waterfall Auto-Routing.")
         is_stream = validated.stream or False
-        return await _router.route_proxy(data, is_stream=is_stream)
+        return await _router.route_proxy(data, is_stream=is_stream, request=request)
 
     # Extract the last user message
     user_prompt = ""
@@ -483,6 +558,7 @@ async def chat_completions(request: Request):
             content=response_text,
             stream=is_stream,
             prompt_text=chat_context,
+            request=request,
         )
 
     # --- FORCED DUAL-ENGINE NLP (Benchmarking) ---
@@ -517,6 +593,7 @@ async def chat_completions(request: Request):
             content=combined,
             stream=is_stream,
             prompt_text=chat_context,
+            request=request,
         )
 
     # --- TOOL-CALLING MODE ---
@@ -606,6 +683,7 @@ async def chat_completions(request: Request):
                 content=response_text,
                 stream=is_stream,
                 prompt_text=prompt_str,
+                request=request,
             )
 
         normalized_calls, fallback_msg = parse_tool_calls(response_text)
@@ -676,6 +754,7 @@ async def chat_completions(request: Request):
                 finish_reason="tool_calls",
                 tool_calls=openai_tool_calls,
                 prompt_text=prompt_str,
+                request=request,
             )
 
         content_to_return = fallback_msg if fallback_msg is not None else response_text
@@ -684,6 +763,7 @@ async def chat_completions(request: Request):
             content=content_to_return,
             stream=is_stream,
             prompt_text=prompt_str,
+            request=request,
         )
 
     # --- AUTONOMOUS AGENT LOOP ---
@@ -773,6 +853,7 @@ async def chat_completions(request: Request):
         content=final_answer,
         stream=is_stream,
         prompt_text=user_prompt,
+        request=request,
     )
 
 
