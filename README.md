@@ -67,7 +67,7 @@ Krusch Agentic MCP decouples the cognitive load into two distinct, specialized p
 
 When an unassisted model attempts to generate code or execute tools, it hallucinates parameters, drops JSON brackets, and skips syntax. 
 
-The Krusch Agentic Proxy acts as a structural safety net. By forcing the model through the Dual-Engine (Thinker + Implementer) pipeline, we see massive gains in reliability for capable edge models (7B-14B) without needing a massive LLM.
+The Krusch Agentic Proxy acts as a structural safety net. By forcing the model through the Dual-Engine (Thinker + Implementer) pipeline, I measured massive gains in reliability for capable edge models (7B-14B) without needing a massive LLM.
 
 #### 1. Weklund Tool-Calling Accuracy (`v0.4.0` Verified across 5-GPU Fleet: 2026-10-18)
 *Demonstrating the elimination of hallucinated parameters and complete multi-tool / conditional planning via `v0.4.0` JSON canonicalization (`temperature=0.0`) across all 3 multi-family GPU compute pools.*

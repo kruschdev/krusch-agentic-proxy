@@ -2,11 +2,11 @@
 
 The Krusch Agentic Proxy was explicitly designed to combat the reasoning and formatting degradation that occurs when consumer GPUs attempt complex tool-calling and code execution. 
 
-We ran a massive 8-hour empirical evaluation against the top open-source reasoning benchmarks using a 7B parameter model. The data proves that forcing a small model into a `<holodata>` Thinker/Implementer loop dramatically increases its structural reliability.
+I ran a massive 8-hour empirical evaluation against the top open-source reasoning benchmarks using a 7B parameter model. The data proves that forcing a small model into a `<holodata>` Thinker/Implementer loop dramatically increases its structural reliability.
 
 ## 📊 The Structural Benchmark Data
 
-When an unassisted model attempts to generate code or execute tools, it hallucinates parameters, drops JSON brackets, and skips syntax. The Krusch Agentic Proxy acts as a structural safety net. By forcing the model through the Dual-Engine (Thinker + Implementer) pipeline, we see massive gains in reliability for capable edge models (7B-14B).
+When an unassisted model attempts to generate code or execute tools, it hallucinates parameters, drops JSON brackets, and skips syntax. The Krusch Agentic Proxy acts as a structural safety net. By forcing the model through the Dual-Engine (Thinker + Implementer) pipeline, I measured massive gains in reliability for capable edge models (7B-14B).
 
 ### 1. Weklund Tool-Calling Accuracy (`v0.4.0` Verified across 5-GPU Fleet: 2026-10-18)
 *Demonstrating the elimination of hallucinated parameters and complete multi-tool / conditional planning via `v0.4.0` JSON canonicalization (`temperature=0.0`) across all 3 compute nodes (`krusch`, `kruschdev`, `kruschserv`).*
@@ -58,7 +58,7 @@ If you wish to reproduce these evaluations on your own hardware, the repository 
 To run the 40-task Weklund Tool-Calling evaluation directly:
 
 ```bash
-/home/krusch/homelab/projects/krusch-law/.venv/bin/python benchmarks/weklund_tools.py
+python3 benchmarks/weklund_tools.py
 ```
 
 To run the full LM Evaluation Harness + Weklund suite against the running gateway (`:5440`):
