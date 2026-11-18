@@ -131,6 +131,14 @@ This project operates within the **Krusch Agentic Ecosystem**, working alongside
 
 ## 🚀 Quick Start Guide
 
+### Agent-Assisted Setup
+
+Ask your coding agent (Claude Code, Codex, Cursor, Windsurf, or Antigravity):
+
+```text
+Read https://raw.githubusercontent.com/kruschdev/krusch-agentic-proxy/main/INSTALL.md and set up krusch-agentic-proxy on this machine.
+```
+
 ### 1. Ensure Ollama is Running on Your Compute Node(s)
 Ensure local Ollama is serving on `http://127.0.0.1:11434/v1/chat/completions` (or configure `KRUSCH_OLLAMA_URL`, `KRUSCHSERV_OLLAMA_URL`, and `KRUSCHDEV_OLLAMA_URL` for multi-node GPU routing).
 
